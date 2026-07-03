@@ -382,25 +382,18 @@ fn prepare_guarded_pending(
     command_kind: &str,
     files: Vec<PendingFile>,
 ) -> anyhow::Result<PendingEdit> {
-    let contract_id = format!("hook-{}", safe_file_id(tool_use_id));
-    let mut contract = safeguard_protocol::ExecutionContract::v0_1(contract_id.clone());
-    contract.workspace.root = cwd.to_string();
-    contract.workspace.allowed_roots = vec![cwd.to_string()];
-    contract.capabilities.push(safeguard_protocol::Capability {
-        tool: tool_name.to_string(),
-        operation: command_kind.to_string(),
-        resources: files.iter().map(|file| file.path.clone()).collect(),
-        constraints: Default::default(),
-    });
-    contract.expected_changes.files = files
-        .iter()
-        .map(|file| safeguard_protocol::ExpectedFileChange {
-            path: file.path.clone(),
-            operation: protocol_file_operation(&file.operation),
-            before_digest: file.before_blake3.clone(),
-            expected_diff_digest: None,
-        })
-        .collect();
+    let contract = load_explicit_contract(cwd)?
+        .map(|contract| enforce_explicit_contract(cwd, tool_name, command_kind, &files, contract))
+        .unwrap_or_else(|| {
+            Ok(implicit_contract(
+                cwd,
+                tool_use_id,
+                tool_name,
+                command_kind,
+                &files,
+            ))
+        })?;
+    let contract_id = contract.contract_id.clone();
 
     let transaction_id = safeguard_transaction::transaction_id_from_contract(&contract)
         .map_err(model_safe_transaction_error)?;
@@ -426,6 +419,162 @@ fn prepare_guarded_pending(
         transaction_record_path: record_path.display().to_string(),
         files,
     })
+}
+
+fn implicit_contract(
+    cwd: &str,
+    tool_use_id: &str,
+    tool_name: &str,
+    command_kind: &str,
+    files: &[PendingFile],
+) -> safeguard_protocol::ExecutionContract {
+    let contract_id = format!("hook-{}", safe_file_id(tool_use_id));
+    let mut contract = safeguard_protocol::ExecutionContract::v0_1(contract_id);
+    contract.workspace.root = cwd.to_string();
+    contract.workspace.allowed_roots = vec![cwd.to_string()];
+    contract.capabilities.push(safeguard_protocol::Capability {
+        tool: tool_name.to_string(),
+        operation: command_kind.to_string(),
+        resources: files.iter().map(|file| file.path.clone()).collect(),
+        constraints: Default::default(),
+    });
+    contract.expected_changes.files = files
+        .iter()
+        .map(|file| safeguard_protocol::ExpectedFileChange {
+            path: file.path.clone(),
+            operation: protocol_file_operation(&file.operation),
+            before_digest: file.before_blake3.clone(),
+            expected_diff_digest: None,
+        })
+        .collect();
+    contract
+}
+
+fn load_explicit_contract(
+    cwd: &str,
+) -> anyhow::Result<Option<safeguard_protocol::ExecutionContract>> {
+    let Ok(value) = std::env::var("SAFEGUARD_CONTRACT_PATH") else {
+        return Ok(None);
+    };
+    if value.trim().is_empty() {
+        return Ok(None);
+    }
+    let path = resolve_contract_path(cwd, &value)?;
+    let bytes = std::fs::read(&path)
+        .with_context(|| format!("failed to read Safeguard contract {}", path.display()))?;
+    let contract = serde_json::from_slice(&bytes)
+        .with_context(|| format!("failed to parse Safeguard contract {}", path.display()))?;
+    Ok(Some(contract))
+}
+
+fn enforce_explicit_contract(
+    cwd: &str,
+    tool_name: &str,
+    command_kind: &str,
+    files: &[PendingFile],
+    mut contract: safeguard_protocol::ExecutionContract,
+) -> anyhow::Result<safeguard_protocol::ExecutionContract> {
+    for file in files {
+        if contract
+            .denied_resources
+            .iter()
+            .any(|resource| resource_matches(cwd, resource, &file.path))
+        {
+            anyhow::bail!("explicit contract denies a patch target");
+        }
+        if !expected_change_matches(cwd, &contract, file) {
+            anyhow::bail!("patch target is not declared in explicit contract");
+        }
+        if !capability_matches(cwd, &contract, tool_name, command_kind, file) {
+            anyhow::bail!("explicit contract does not grant this patch capability");
+        }
+    }
+
+    for expected in &mut contract.expected_changes.files {
+        if expected.before_digest.is_none()
+            && let Some(file) = files
+                .iter()
+                .find(|file| resource_matches(cwd, &expected.path, &file.path))
+        {
+            expected.before_digest = file.before_blake3.clone();
+        }
+    }
+    Ok(contract)
+}
+
+fn expected_change_matches(
+    cwd: &str,
+    contract: &safeguard_protocol::ExecutionContract,
+    file: &PendingFile,
+) -> bool {
+    contract.expected_changes.files.iter().any(|expected| {
+        expected.operation == protocol_file_operation(&file.operation)
+            && resource_matches(cwd, &expected.path, &file.path)
+    })
+}
+
+fn capability_matches(
+    cwd: &str,
+    contract: &safeguard_protocol::ExecutionContract,
+    tool_name: &str,
+    command_kind: &str,
+    file: &PendingFile,
+) -> bool {
+    contract.capabilities.iter().any(|capability| {
+        (capability.tool == "*" || capability.tool == tool_name)
+            && (capability.operation == "*" || capability.operation == command_kind)
+            && capability
+                .resources
+                .iter()
+                .any(|resource| resource_matches(cwd, resource, &file.path))
+    })
+}
+
+fn resource_matches(cwd: &str, resource: &str, target: &str) -> bool {
+    if resource == "*" {
+        return true;
+    }
+    if let Some(prefix) = resource
+        .strip_suffix("/**")
+        .or_else(|| resource.strip_suffix("\\**"))
+    {
+        return resolve_resource_path(cwd, prefix).is_some_and(|path| {
+            PathBuf::from(target)
+                .canonicalize()
+                .unwrap_or_else(|_| PathBuf::from(target))
+                .starts_with(path)
+        });
+    }
+    resolve_resource_path(cwd, resource).is_some_and(|path| {
+        PathBuf::from(target)
+            .canonicalize()
+            .unwrap_or_else(|_| PathBuf::from(target))
+            == path
+    })
+}
+
+fn resolve_resource_path(cwd: &str, resource: &str) -> Option<PathBuf> {
+    let cwd = PathBuf::from(cwd).canonicalize().ok()?;
+    let candidate = if Path::new(resource).is_absolute() {
+        PathBuf::from(resource)
+    } else {
+        cwd.join(resource)
+    };
+    if candidate.exists() {
+        candidate.canonicalize().ok()
+    } else {
+        let parent = candidate.parent()?.canonicalize().ok()?;
+        let file_name = candidate.file_name()?;
+        Some(parent.join(file_name))
+    }
+}
+
+fn resolve_contract_path(cwd: &str, value: &str) -> anyhow::Result<PathBuf> {
+    let path = PathBuf::from(value);
+    if path.is_absolute() {
+        return Ok(path);
+    }
+    Ok(PathBuf::from(cwd).join(path))
 }
 
 fn protocol_file_operation(operation: &str) -> safeguard_protocol::FileOperation {
@@ -798,8 +947,10 @@ fn preview(command: &str) -> String {
 mod tests {
     use std::path::PathBuf;
 
+    use super::enforce_explicit_contract;
     use super::extract_patch;
     use super::handle_recover_cli;
+    use super::implicit_contract;
     use super::is_risky_shell_write;
     use super::patch_targets;
     use super::plan_patch_files;
@@ -946,6 +1097,57 @@ PATCH"#;
         assert!(std::fs::read_to_string(&file).is_ok_and(|value| value == "alpha"));
         assert_eq!(count_files(state_root(root).join("locks"), "lock"), 0);
         assert_eq!(count_files(state_root(root).join("receipts"), "json"), 1);
+    }
+
+    #[test]
+    fn explicit_contract_allows_declared_patch() {
+        let fixture = Fixture::new("explicit_contract_allows_declared_patch");
+        let file = fixture.root.join("a.txt");
+        assert!(std::fs::write(&file, "alpha").is_ok());
+        let Some(root) = fixture.root.to_str() else {
+            assert_eq!(fixture.root.display().to_string(), "");
+            return;
+        };
+        let files = vec![super::PendingFile {
+            path: file.display().to_string(),
+            operation: "update".to_string(),
+            existed_before: true,
+            before_blake3: None,
+        }];
+        let contract = implicit_contract(root, "contract-ok", "Bash", "bash_apply_patch", &files);
+        let enforced =
+            enforce_explicit_contract(root, "Bash", "bash_apply_patch", &files, contract);
+        assert!(enforced.is_ok());
+    }
+
+    #[test]
+    fn explicit_contract_rejects_undeclared_patch() {
+        let fixture = Fixture::new("explicit_contract_rejects_undeclared_patch");
+        let file = fixture.root.join("a.txt");
+        let other = fixture.root.join("b.txt");
+        assert!(std::fs::write(&file, "alpha").is_ok());
+        assert!(std::fs::write(&other, "beta").is_ok());
+        let Some(root) = fixture.root.to_str() else {
+            assert_eq!(fixture.root.display().to_string(), "");
+            return;
+        };
+        let declared = vec![super::PendingFile {
+            path: file.display().to_string(),
+            operation: "update".to_string(),
+            existed_before: true,
+            before_blake3: None,
+        }];
+        let attempted = vec![super::PendingFile {
+            path: other.display().to_string(),
+            operation: "update".to_string(),
+            existed_before: true,
+            before_blake3: None,
+        }];
+        let contract =
+            implicit_contract(root, "contract-deny", "Bash", "bash_apply_patch", &declared);
+        let enforced =
+            enforce_explicit_contract(root, "Bash", "bash_apply_patch", &attempted, contract);
+        assert!(enforced.is_err());
     }
 
     fn count_files(dir: PathBuf, extension: &str) -> usize {

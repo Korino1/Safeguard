@@ -71,6 +71,12 @@ Policy mode:
 - default `SAFEGUARD_MODE=protect`: allow guarded native patches, block obvious shell writes.
 - `SAFEGUARD_MODE=monitor`: audit shell writes without blocking.
 
+Optional execution contract:
+
+- Set `SAFEGUARD_CONTRACT_PATH` to a local `ExecutionContract v0.1` JSON file when an orchestrator wants explicit capability enforcement.
+- If no contract path is set, Safeguard creates an implicit local contract for native patch edits.
+- Contract parsing, capability checks, expected-file checks, and denied-resource checks happen inside the hook layer.
+
 ## MCP Tools
 
 - `sg_ping` - connectivity check.
