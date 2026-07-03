@@ -57,6 +57,8 @@ struct PendingEdit {
     contract_id: String,
     transaction_id: String,
     transaction_record_path: String,
+    #[serde(default)]
+    contract_hash: Option<String>,
     files: Vec<PendingFile>,
 }
 
@@ -426,6 +428,7 @@ fn prepare_guarded_pending(
         tool_name: tool_name.to_string(),
         cwd: cwd.to_string(),
         command_kind: command_kind.to_string(),
+        contract_hash: contract_hash(&contract),
         contract_id,
         transaction_id: transaction_id.as_str().to_string(),
         transaction_record_path: record_path.display().to_string(),
@@ -460,6 +463,12 @@ fn implicit_contract(
         })
         .collect();
     contract
+}
+
+fn contract_hash(contract: &safeguard_protocol::ExecutionContract) -> Option<String> {
+    serde_json::to_vec(contract)
+        .ok()
+        .map(|bytes| safeguard_core::blake3_hex(&bytes).as_hex().to_string())
 }
 
 fn load_explicit_contract(
@@ -670,6 +679,55 @@ fn write_execution_receipt(
     std::fs::create_dir_all(&dir)?;
     let path = dir.join(format!("{}.json", safe_file_id(&receipt.receipt_id)));
     std::fs::write(&path, serde_json::to_vec_pretty(&receipt)?)?;
+    let _ = write_memoryx_evidence(pending, &receipt, &path);
+    Ok(path)
+}
+
+fn write_memoryx_evidence(
+    pending: &PendingEdit,
+    receipt: &safeguard_protocol::ExecutionReceipt,
+    receipt_path: &Path,
+) -> anyhow::Result<PathBuf> {
+    let receipt_hash = receipt.receipt_hash.clone().unwrap_or_else(|| {
+        safeguard_core::blake3_hex(receipt.receipt_id.as_bytes())
+            .as_hex()
+            .to_string()
+    });
+    let contract_hash = pending.contract_hash.clone().unwrap_or_else(|| {
+        safeguard_core::blake3_hex(pending.contract_id.as_bytes())
+            .as_hex()
+            .to_string()
+    });
+    let evidence = safeguard_protocol::MemoryxEvidence {
+        schema_version: safeguard_protocol::SCHEMA_VERSION_0_1.to_string(),
+        contract_id: pending.contract_id.clone(),
+        receipt_id: receipt.receipt_id.clone(),
+        claim: format!(
+            "Safeguard receipt {} ended with status {:?}",
+            receipt.receipt_id, receipt.status
+        ),
+        basis: safeguard_protocol::EvidenceBasis {
+            contract_hash,
+            receipt_hash,
+            source_paths: vec![receipt_path.display().to_string()],
+        },
+        summary: safeguard_protocol::EvidenceSummary {
+            changed_files_count: receipt.changed_files.len(),
+            validations_passed: receipt
+                .validations
+                .iter()
+                .filter(|validation| {
+                    validation.status == safeguard_protocol::ValidationStatus::Passed
+                })
+                .count(),
+            policy_violations_count: receipt.policy_violations.len(),
+        },
+    };
+
+    let dir = state_root(&pending.cwd).join("evidence");
+    std::fs::create_dir_all(&dir)?;
+    let path = dir.join(format!("{}.json", safe_file_id(&receipt.receipt_id)));
+    std::fs::write(&path, serde_json::to_vec_pretty(&evidence)?)?;
     Ok(path)
 }
 
@@ -1089,6 +1147,7 @@ PATCH"#;
             .and_then(|path| receipt_field(path, "previous_receipt_hash"));
         assert!(first_hash.is_some());
         assert_eq!(previous_hash, first_hash);
+        assert_eq!(count_files(state_root(root).join("evidence"), "json"), 1);
         assert!(write_pending(&pending).is_ok());
         assert!(read_pending(root, "unit-1").is_ok_and(|pending| pending.is_some()));
 

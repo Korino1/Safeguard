@@ -16,6 +16,7 @@ Current plugin id: `safeguard@safeguard-local`.
 - Enforces workspace-root containment for file edits.
 - Writes internal hook and MCP audit metadata to `.safeguard/audit.jsonl`.
 - Writes native edit execution receipts to `.safeguard/receipts/`.
+- Writes compact MemoryX-shaped evidence summaries to `.safeguard/evidence/`.
 - Keeps hash/integrity metadata inside the plugin wrapper; normal model-facing responses do not expose digests.
 
 ## Repository Layout
@@ -93,7 +94,7 @@ Use Codex normally. Safeguard protects native edit paths through plugin hooks.
 
 Use `sg_dry` and `sg_apply` only when you explicitly want the MCP fallback/API for a deterministic text replacement. The tool rejects missing, empty, or ambiguous fragments.
 
-Audit records are stored locally in `.safeguard/audit.jsonl`. Execution receipts are stored locally in `.safeguard/receipts/`. These files are ignored by git.
+Audit records are stored locally in `.safeguard/audit.jsonl`. Execution receipts are stored locally in `.safeguard/receipts/`. MemoryX-shaped evidence summaries are stored locally in `.safeguard/evidence/`. These files are ignored by git.
 
 ## Recovery
 
