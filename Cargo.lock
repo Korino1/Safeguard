@@ -120,6 +120,8 @@ version = "1.1.0"
 dependencies = [
  "anyhow",
  "safeguard-core",
+ "safeguard-protocol",
+ "safeguard-transaction",
  "serde",
  "serde_json",
 ]

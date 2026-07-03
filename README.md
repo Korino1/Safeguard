@@ -9,6 +9,7 @@ Current plugin id: `safeguard@safeguard-local`.
 - Installs through the official Codex plugin marketplace flow.
 - Installs plugin-bundled lifecycle hooks for transparent native edit protection.
 - Audits ordinary Codex `apply_patch` edits without requiring the model to call a special tool.
+- Wraps native patch edits in a local transaction record with target locks and rollback snapshots.
 - Blocks obvious direct shell write commands in default protect mode.
 - Exposes guarded text-replacement MCP tools as an explicit fallback/API.
 - Requires the old text fragment to appear exactly once before planning or applying an edit.
@@ -57,7 +58,9 @@ Expected final state:
 Normal Codex editing should stay normal. The model can use native `apply_patch`; Safeguard hooks run before and after the edit.
 
 - `PreToolUse` records target files and before-digests for native `apply_patch`.
+- `PreToolUse` creates a guarded transaction record and target lock set.
 - `PostToolUse` records after-digests and changed-file evidence.
+- `PostToolUse` completes the transaction and releases target locks.
 - `PermissionRequest` denies risky direct shell writes in protect mode.
 - Internal digests are written to `.safeguard/audit.jsonl`, not to model context.
 

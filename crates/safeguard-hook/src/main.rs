@@ -47,6 +47,9 @@ struct PendingEdit {
     tool_name: String,
     cwd: String,
     command_kind: String,
+    contract_id: String,
+    transaction_id: String,
+    transaction_record_path: String,
     files: Vec<PendingFile>,
 }
 
@@ -78,21 +81,21 @@ fn pre_tool_use(request: &HookRequest) -> Value {
             .and_then(|command| plan_patch_files(&request.cwd, command).ok())
         {
             Some(files) => {
-                let pending = PendingEdit {
-                    tool_use_id: request
-                        .tool_use_id
-                        .clone()
-                        .unwrap_or_else(|| "unknown-tool-use".to_string()),
-                    tool_name: tool_name.to_string(),
-                    cwd: request.cwd.clone(),
-                    command_kind: "apply_patch".to_string(),
+                let tool_use_id = request
+                    .tool_use_id
+                    .clone()
+                    .unwrap_or_else(|| "unknown-tool-use".to_string());
+                match prepare_and_write_guarded_pending(
+                    &request.cwd,
+                    &tool_use_id,
+                    tool_name,
+                    "apply_patch",
                     files,
-                };
-                match write_pending(&pending) {
+                ) {
                     Ok(()) => continue_output(),
-                    Err(err) => {
-                        deny_pre_tool_use(format!("Safeguard could not record patch intent: {err}"))
-                    }
+                    Err(err) => deny_pre_tool_use(format!(
+                        "Safeguard could not prepare guarded patch: {err}"
+                    )),
                 }
             }
             None => deny_pre_tool_use(
@@ -107,20 +110,20 @@ fn pre_tool_use(request: &HookRequest) -> Value {
         if command.contains("apply_patch") {
             return match plan_patch_files(&request.cwd, command) {
                 Ok(files) => {
-                    let pending = PendingEdit {
-                        tool_use_id: request
-                            .tool_use_id
-                            .clone()
-                            .unwrap_or_else(|| stable_id_for_command(command)),
-                        tool_name: tool_name.to_string(),
-                        cwd: request.cwd.clone(),
-                        command_kind: "bash_apply_patch".to_string(),
+                    let tool_use_id = request
+                        .tool_use_id
+                        .clone()
+                        .unwrap_or_else(|| stable_id_for_command(command));
+                    match prepare_and_write_guarded_pending(
+                        &request.cwd,
+                        &tool_use_id,
+                        tool_name,
+                        "bash_apply_patch",
                         files,
-                    };
-                    match write_pending(&pending) {
+                    ) {
                         Ok(()) => continue_output(),
                         Err(err) => deny_pre_tool_use(format!(
-                            "Safeguard could not record shell patch intent: {err}"
+                            "Safeguard could not prepare guarded shell patch: {err}"
                         )),
                     }
                 }
@@ -217,10 +220,15 @@ fn post_tool_use(request: &HookRequest) -> Value {
             "tool": pending.tool_name,
             "command_kind": pending.command_kind,
             "tool_use_id": pending.tool_use_id,
+            "contract_id": pending.contract_id,
+            "transaction_id": pending.transaction_id,
             "success": success,
             "files": files
         }),
     );
+    if let Ok(id) = safeguard_transaction::TransactionId::new(pending.transaction_id.clone()) {
+        let _ = safeguard_transaction::complete_transaction(state_root(&pending.cwd), &id);
+    }
     let _ = remove_pending(&request.cwd, tool_use_id);
     continue_output()
 }
@@ -251,6 +259,117 @@ fn safeguard_mode() -> String {
     std::env::var("SAFEGUARD_MODE")
         .unwrap_or_else(|_| "protect".to_string())
         .to_ascii_lowercase()
+}
+
+fn prepare_and_write_guarded_pending(
+    cwd: &str,
+    tool_use_id: &str,
+    tool_name: &str,
+    command_kind: &str,
+    files: Vec<PendingFile>,
+) -> anyhow::Result<()> {
+    let pending = prepare_guarded_pending(cwd, tool_use_id, tool_name, command_kind, files)?;
+    if let Err(err) = write_pending(&pending) {
+        if let Ok(id) = safeguard_transaction::TransactionId::new(pending.transaction_id.clone()) {
+            let _ = safeguard_transaction::complete_transaction(state_root(&pending.cwd), &id);
+        }
+        return Err(err);
+    }
+    Ok(())
+}
+
+fn prepare_guarded_pending(
+    cwd: &str,
+    tool_use_id: &str,
+    tool_name: &str,
+    command_kind: &str,
+    files: Vec<PendingFile>,
+) -> anyhow::Result<PendingEdit> {
+    let contract_id = format!("hook-{}", safe_file_id(tool_use_id));
+    let mut contract = safeguard_protocol::ExecutionContract::v0_1(contract_id.clone());
+    contract.workspace.root = cwd.to_string();
+    contract.workspace.allowed_roots = vec![cwd.to_string()];
+    contract.capabilities.push(safeguard_protocol::Capability {
+        tool: tool_name.to_string(),
+        operation: command_kind.to_string(),
+        resources: files.iter().map(|file| file.path.clone()).collect(),
+        constraints: Default::default(),
+    });
+    contract.expected_changes.files = files
+        .iter()
+        .map(|file| safeguard_protocol::ExpectedFileChange {
+            path: file.path.clone(),
+            operation: protocol_file_operation(&file.operation),
+            before_digest: file.before_blake3.clone(),
+            expected_diff_digest: None,
+        })
+        .collect();
+
+    let transaction_id = safeguard_transaction::transaction_id_from_contract(&contract)
+        .map_err(model_safe_transaction_error)?;
+    let targets = safeguard_transaction::targets_from_contract(&contract);
+    let guard = safeguard_transaction::begin_transaction(
+        cwd,
+        state_root(cwd),
+        transaction_id.clone(),
+        &targets,
+    )
+    .map_err(model_safe_transaction_error)?;
+    let record_path = guard
+        .persist_record_keep_locks()
+        .map_err(model_safe_transaction_error)?;
+
+    Ok(PendingEdit {
+        tool_use_id: tool_use_id.to_string(),
+        tool_name: tool_name.to_string(),
+        cwd: cwd.to_string(),
+        command_kind: command_kind.to_string(),
+        contract_id,
+        transaction_id: transaction_id.as_str().to_string(),
+        transaction_record_path: record_path.display().to_string(),
+        files,
+    })
+}
+
+fn protocol_file_operation(operation: &str) -> safeguard_protocol::FileOperation {
+    match operation {
+        "add" => safeguard_protocol::FileOperation::Add,
+        "delete" => safeguard_protocol::FileOperation::Delete,
+        _ => safeguard_protocol::FileOperation::Modify,
+    }
+}
+
+fn model_safe_transaction_error(err: safeguard_transaction::TransactionError) -> anyhow::Error {
+    let message = match err {
+        safeguard_transaction::TransactionError::InvalidTransactionId => {
+            "invalid guarded edit id".to_string()
+        }
+        safeguard_transaction::TransactionError::PathOutsideWorkspace { .. } => {
+            "patch target is outside the workspace".to_string()
+        }
+        safeguard_transaction::TransactionError::SymlinkTarget { .. } => {
+            "patch target is a symlink".to_string()
+        }
+        safeguard_transaction::TransactionError::StaleDigest { .. } => {
+            "target changed after the edit was planned; retry with fresh file contents".to_string()
+        }
+        safeguard_transaction::TransactionError::LockHeld { .. } => {
+            "target is already locked by another guarded edit".to_string()
+        }
+        safeguard_transaction::TransactionError::Io { operation, .. } => {
+            format!("guarded edit storage failed during {operation}")
+        }
+        safeguard_transaction::TransactionError::SerializeRecord(_) => {
+            "guarded edit record could not be written".to_string()
+        }
+        safeguard_transaction::TransactionError::DeserializeRecord(_) => {
+            "guarded edit record could not be read".to_string()
+        }
+        safeguard_transaction::TransactionError::Time(_) => {
+            "system clock prevented guarded edit setup".to_string()
+        }
+    };
+    anyhow::anyhow!(message)
 }
 
 fn plan_patch_files(cwd: &str, command: &str) -> anyhow::Result<Vec<PendingFile>> {
@@ -355,11 +474,15 @@ fn is_risky_shell_write(command: &str) -> bool {
 }
 
 fn pending_dir(cwd: &str) -> PathBuf {
-    PathBuf::from(cwd).join(".safeguard").join("pending")
+    state_root(cwd).join("pending")
 }
 
 fn audit_path(cwd: &str) -> PathBuf {
-    PathBuf::from(cwd).join(".safeguard").join("audit.jsonl")
+    state_root(cwd).join("audit.jsonl")
+}
+
+fn state_root(cwd: &str) -> PathBuf {
+    PathBuf::from(cwd).join(".safeguard")
 }
 
 fn write_pending(pending: &PendingEdit) -> anyhow::Result<()> {
@@ -429,9 +552,16 @@ fn preview(command: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+
     use super::extract_patch;
     use super::is_risky_shell_write;
     use super::patch_targets;
+    use super::plan_patch_files;
+    use super::prepare_guarded_pending;
+    use super::read_pending;
+    use super::state_root;
+    use super::write_pending;
 
     #[test]
     fn extracts_patch_targets() {
@@ -457,5 +587,86 @@ PATCH"#,
         assert!(is_risky_shell_write("Set-Content file.txt value"));
         assert!(is_risky_shell_write("cat > file.txt"));
         assert!(!is_risky_shell_write("cargo test --workspace"));
+    }
+
+    #[test]
+    fn guarded_pending_keeps_transaction_until_completed() {
+        let fixture = Fixture::new("guarded_pending_keeps_transaction_until_completed");
+        let file = fixture.root.join("a.txt");
+        assert!(std::fs::write(&file, "alpha").is_ok());
+        let Some(root) = fixture.root.to_str() else {
+            assert_eq!(fixture.root.display().to_string(), "");
+            return;
+        };
+        let command = r#"apply_patch <<'PATCH'
+*** Begin Patch
+*** Update File: a.txt
+@@
+-alpha
++beta
+*** End Patch
+PATCH"#;
+        let files = match plan_patch_files(root, command) {
+            Ok(files) => files,
+            Err(err) => {
+                assert_eq!(err.to_string(), "");
+                return;
+            }
+        };
+        let pending =
+            match prepare_guarded_pending(root, "unit-1", "Bash", "bash_apply_patch", files) {
+                Ok(pending) => pending,
+                Err(err) => {
+                    assert_eq!(err.to_string(), "");
+                    return;
+                }
+            };
+
+        assert!(PathBuf::from(&pending.transaction_record_path).exists());
+        assert_eq!(count_files(state_root(root).join("locks"), "lock"), 1);
+        assert!(write_pending(&pending).is_ok());
+        assert!(read_pending(root, "unit-1").is_ok_and(|pending| pending.is_some()));
+
+        let id = match safeguard_transaction::TransactionId::new(pending.transaction_id) {
+            Ok(id) => id,
+            Err(err) => {
+                assert_eq!(err.to_string(), "");
+                return;
+            }
+        };
+        assert!(safeguard_transaction::complete_transaction(state_root(root), &id).is_ok());
+        assert_eq!(count_files(state_root(root).join("locks"), "lock"), 0);
+    }
+
+    fn count_files(dir: PathBuf, extension: &str) -> usize {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return 0;
+        };
+        entries
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry.path().extension().and_then(|value| value.to_str()) == Some(extension)
+            })
+            .count()
+    }
+
+    struct Fixture {
+        root: PathBuf,
+    }
+
+    impl Fixture {
+        fn new(name: &str) -> Self {
+            let root =
+                std::env::temp_dir().join(format!("safeguard-hook-{}-{name}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&root);
+            assert!(std::fs::create_dir_all(&root).is_ok());
+            Self { root }
+        }
+    }
+
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
     }
 }

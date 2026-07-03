@@ -10,5 +10,7 @@ workspace = true
 [dependencies]
 anyhow.workspace = true
 safeguard-core = { path = "../safeguard-core" }
+safeguard-protocol = { path = "../safeguard-protocol" }
+safeguard-transaction = { path = "../safeguard-transaction" }
 serde.workspace = true
 serde_json.workspace = true

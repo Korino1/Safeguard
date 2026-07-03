@@ -86,27 +86,19 @@ impl TransactionGuard {
 
     /// Persist a transaction record for recovery/audit layers.
     pub fn persist_record(&self) -> Result<PathBuf, TransactionError> {
-        let transactions_dir = self.state_root.join("transactions");
-        std::fs::create_dir_all(&transactions_dir).map_err(|source| TransactionError::Io {
-            operation: "create transactions directory",
-            path: transactions_dir.clone(),
-            source,
-        })?;
-
-        let record_path = transactions_dir.join(format!("{}.json", self.id.as_str()));
         let started_at = unix_timestamp()?;
         let record = TransactionRecord {
             transaction_id: self.id.as_str().to_string(),
             started_at,
             targets: self.targets.clone(),
         };
-        let bytes =
-            serde_json::to_vec_pretty(&record).map_err(TransactionError::SerializeRecord)?;
-        std::fs::write(&record_path, bytes).map_err(|source| TransactionError::Io {
-            operation: "write transaction record",
-            path: record_path.clone(),
-            source,
-        })?;
+        write_transaction_record(&self.state_root, &self.id, &record)
+    }
+
+    /// Persist a transaction record and leave lock files for another process to complete.
+    pub fn persist_record_keep_locks(mut self) -> Result<PathBuf, TransactionError> {
+        let record_path = self.persist_record()?;
+        self.lock_paths.clear();
         Ok(record_path)
     }
 }
@@ -119,11 +111,15 @@ impl Drop for TransactionGuard {
     }
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-struct TransactionRecord {
-    transaction_id: String,
-    started_at: u64,
-    targets: Vec<LockedTarget>,
+/// Persisted transaction metadata used to finish or recover guarded edits.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TransactionRecord {
+    /// Transaction id.
+    pub transaction_id: String,
+    /// Unix timestamp when the transaction started.
+    pub started_at: u64,
+    /// Targets locked by this transaction.
+    pub targets: Vec<LockedTarget>,
 }
 
 /// Summary of transaction records left after an interrupted run.
@@ -177,6 +173,8 @@ pub enum TransactionError {
     },
     /// JSON serialization failed.
     SerializeRecord(serde_json::Error),
+    /// JSON deserialization failed.
+    DeserializeRecord(serde_json::Error),
     /// System time is earlier than Unix epoch.
     Time(std::time::SystemTimeError),
 }
@@ -218,6 +216,9 @@ impl fmt::Display for TransactionError {
                 source,
             } => write!(f, "{operation} failed for {}: {source}", path.display()),
             Self::SerializeRecord(source) => write!(f, "failed to serialize transaction: {source}"),
+            Self::DeserializeRecord(source) => {
+                write!(f, "failed to deserialize transaction: {source}")
+            }
             Self::Time(source) => write!(f, "system time is before unix epoch: {source}"),
         }
     }
@@ -355,6 +356,55 @@ pub fn recovery_candidates(
     Ok(candidates)
 }
 
+/// Load a persisted transaction record.
+pub fn load_transaction_record(
+    state_root: impl AsRef<Path>,
+    id: &TransactionId,
+) -> Result<Option<TransactionRecord>, TransactionError> {
+    let path = transaction_record_path(state_root.as_ref(), id);
+    if !path.exists() {
+        return Ok(None);
+    }
+    let bytes = std::fs::read(&path).map_err(|source| TransactionError::Io {
+        operation: "read transaction record",
+        path: path.clone(),
+        source,
+    })?;
+    serde_json::from_slice(&bytes)
+        .map(Some)
+        .map_err(TransactionError::DeserializeRecord)
+}
+
+/// Complete a persisted transaction and release its lock files.
+pub fn complete_transaction(
+    state_root: impl AsRef<Path>,
+    id: &TransactionId,
+) -> Result<(), TransactionError> {
+    let state_root = state_root.as_ref();
+    if let Some(record) = load_transaction_record(state_root, id)? {
+        for target in record.targets {
+            let lock_path = lock_path_for_key(state_root, &target.lock_key);
+            if lock_path.exists() {
+                std::fs::remove_file(&lock_path).map_err(|source| TransactionError::Io {
+                    operation: "remove target lock",
+                    path: lock_path.clone(),
+                    source,
+                })?;
+            }
+        }
+    }
+
+    let record_path = transaction_record_path(state_root, id);
+    if record_path.exists() {
+        std::fs::remove_file(&record_path).map_err(|source| TransactionError::Io {
+            operation: "remove transaction record",
+            path: record_path,
+            source,
+        })?;
+    }
+    Ok(())
+}
+
 fn canonicalize_existing(
     path: &Path,
     operation: &'static str,
@@ -465,6 +515,38 @@ fn lock_key_for_path(path: &Path) -> String {
     safeguard_core::blake3_hex(path.display().to_string().as_bytes()).as_hex()[..24].to_string()
 }
 
+fn transaction_record_path(state_root: &Path, id: &TransactionId) -> PathBuf {
+    state_root
+        .join("transactions")
+        .join(format!("{}.json", id.as_str()))
+}
+
+fn lock_path_for_key(state_root: &Path, lock_key: &str) -> PathBuf {
+    state_root.join("locks").join(format!("{lock_key}.lock"))
+}
+
+fn write_transaction_record(
+    state_root: &Path,
+    id: &TransactionId,
+    record: &TransactionRecord,
+) -> Result<PathBuf, TransactionError> {
+    let transactions_dir = state_root.join("transactions");
+    std::fs::create_dir_all(&transactions_dir).map_err(|source| TransactionError::Io {
+        operation: "create transactions directory",
+        path: transactions_dir,
+        source,
+    })?;
+
+    let record_path = transaction_record_path(state_root, id);
+    let bytes = serde_json::to_vec_pretty(record).map_err(TransactionError::SerializeRecord)?;
+    std::fs::write(&record_path, bytes).map_err(|source| TransactionError::Io {
+        operation: "write transaction record",
+        path: record_path.clone(),
+        source,
+    })?;
+    Ok(record_path)
+}
+
 fn unix_timestamp() -> Result<u64, TransactionError> {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -494,6 +576,8 @@ mod tests {
     use super::TransactionId;
     use super::TransactionTarget;
     use super::begin_transaction;
+    use super::complete_transaction;
+    use super::load_transaction_record;
     use super::recovery_candidates;
     use super::targets_from_contract;
     use super::transaction_id_from_contract;
@@ -535,6 +619,51 @@ mod tests {
         assert!(record.is_ok());
         let candidates = recovery_candidates(&fixture.state);
         assert!(candidates.is_ok_and(|items| items.len() == 1));
+    }
+
+    #[test]
+    fn persistent_transaction_keeps_locks_until_completed() {
+        let fixture = Fixture::new("persistent_transaction_keeps_locks_until_completed");
+        let file = fixture.workspace.join("a.txt");
+        assert!(std::fs::write(&file, "alpha").is_ok());
+        let id = valid_id("tx-persist");
+
+        let guard = match begin_transaction(
+            &fixture.workspace,
+            &fixture.state,
+            id.clone(),
+            &[TransactionTarget {
+                path: PathBuf::from("a.txt"),
+                expected_blake3: None,
+            }],
+        ) {
+            Ok(guard) => guard,
+            Err(err) => {
+                assert_eq!(err.to_string(), "");
+                return;
+            }
+        };
+        let lock_path = fixture
+            .state
+            .join("locks")
+            .join(format!("{}.lock", guard.targets()[0].lock_key));
+        let record_path = guard.persist_record_keep_locks();
+
+        assert!(record_path.as_ref().is_ok_and(|path| path.exists()));
+        assert!(lock_path.exists());
+        let record = load_transaction_record(&fixture.state, &id);
+        assert!(record.is_ok_and(|record| record.is_some()));
+
+        let completed = complete_transaction(&fixture.state, &id);
+        assert!(completed.is_ok());
+        assert!(!lock_path.exists());
+        assert!(
+            !fixture
+                .state
+                .join("transactions")
+                .join(format!("{}.json", id.as_str()))
+                .exists()
+        );
     }
 
     #[test]

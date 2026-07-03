@@ -176,11 +176,11 @@ Implemented now:
 - transparent plugin hook layer;
 - short MCP fallback tools;
 - internal audit JSONL;
-- initial transaction crate skeleton with locks, digest CAS, rollback snapshots, and recovery candidate scan.
+- initial transaction crate with locks, digest CAS, rollback snapshots, recovery candidate scan, and `ExecutionContract` target mapping;
+- hook-side implicit `ExecutionContract` binding for native `apply_patch`;
+- persistent transaction lifecycle across separate `PreToolUse` and `PostToolUse` hook processes.
 
 Next Safeguard implementation steps:
 
-- make `safeguard-transaction` consume `ExecutionContract` target scopes;
-- make `safeguard-hook` bind native `apply_patch` to a contract or a default implicit contract;
 - emit `ExecutionReceipt v0.1` for accepted and rejected transactions;
 - add evidence export summaries shaped so a future MemoryX/Cabal/Safeguard symbiosis project can ingest them without schema redesign.
