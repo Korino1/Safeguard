@@ -193,6 +193,7 @@ fn post_tool_use(request: &HookRequest) -> Value {
         .and_then(Value::as_bool)
         .unwrap_or(false);
     let mut files = Vec::new();
+    let mut changed_files = Vec::new();
     for file in &pending.files {
         let path = PathBuf::from(&file.path);
         let after_blake3 = if path.exists() {
@@ -211,7 +212,16 @@ fn post_tool_use(request: &HookRequest) -> Value {
             "before_blake3": file.before_blake3,
             "after_blake3": after_blake3
         }));
+        changed_files.push(safeguard_protocol::ChangedFile {
+            path: file.path.clone(),
+            operation: protocol_file_operation(&file.operation),
+            before_digest: file.before_blake3.clone(),
+            after_digest: after_blake3,
+            diff_digest: None,
+        });
     }
+    let started_at = transaction_started_at(&pending).unwrap_or_else(current_unix_timestamp);
+    let _ = write_execution_receipt(&pending, success, started_at, changed_files);
 
     let _ = append_policy_audit(
         &pending.cwd,
@@ -337,6 +347,78 @@ fn protocol_file_operation(operation: &str) -> safeguard_protocol::FileOperation
         "delete" => safeguard_protocol::FileOperation::Delete,
         _ => safeguard_protocol::FileOperation::Modify,
     }
+}
+
+fn transaction_started_at(pending: &PendingEdit) -> Option<u64> {
+    let id = safeguard_transaction::TransactionId::new(pending.transaction_id.clone()).ok()?;
+    safeguard_transaction::load_transaction_record(state_root(&pending.cwd), &id)
+        .ok()
+        .flatten()
+        .map(|record| record.started_at)
+}
+
+fn write_execution_receipt(
+    pending: &PendingEdit,
+    success: bool,
+    started_at: u64,
+    changed_files: Vec<safeguard_protocol::ChangedFile>,
+) -> anyhow::Result<PathBuf> {
+    let receipt_id = format!("receipt-{}", safe_file_id(&pending.tool_use_id));
+    let mut receipt = safeguard_protocol::ExecutionReceipt {
+        schema_version: safeguard_protocol::SCHEMA_VERSION_0_1.to_string(),
+        contract_id: pending.contract_id.clone(),
+        receipt_id,
+        status: if success {
+            safeguard_protocol::ReceiptStatus::Accepted
+        } else {
+            safeguard_protocol::ReceiptStatus::Rejected
+        },
+        started_at: format!("unix:{started_at}"),
+        completed_at: format!("unix:{}", current_unix_timestamp()),
+        executor: safeguard_protocol::ReceiptExecutor {
+            system: "safeguard-hook".to_string(),
+            version: env!("CARGO_PKG_VERSION").to_string(),
+        },
+        observed_operations: changed_files
+            .iter()
+            .map(|file| safeguard_protocol::ObservedOperation {
+                tool: pending.tool_name.clone(),
+                operation: pending.command_kind.clone(),
+                path: Some(file.path.clone()),
+                command: None,
+            })
+            .collect(),
+        changed_files,
+        validations: Vec::new(),
+        policy_violations: Vec::new(),
+        invariants: vec![safeguard_protocol::InvariantResult {
+            name: "transaction_completed".to_string(),
+            status: if success {
+                safeguard_protocol::InvariantStatus::Passed
+            } else {
+                safeguard_protocol::InvariantStatus::Failed
+            },
+        }],
+        receipt_hash: None,
+        previous_receipt_hash: None,
+        signature: None,
+        extensions: Default::default(),
+    };
+    let unsigned = serde_json::to_vec(&receipt)?;
+    receipt.receipt_hash = Some(safeguard_core::blake3_hex(&unsigned).as_hex().to_string());
+
+    let dir = state_root(&pending.cwd).join("receipts");
+    std::fs::create_dir_all(&dir)?;
+    let path = dir.join(format!("{}.json", safe_file_id(&receipt.receipt_id)));
+    std::fs::write(&path, serde_json::to_vec_pretty(&receipt)?)?;
+    Ok(path)
+}
+
+fn current_unix_timestamp() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or_default()
 }
 
 fn model_safe_transaction_error(err: safeguard_transaction::TransactionError) -> anyhow::Error {
@@ -561,6 +643,7 @@ mod tests {
     use super::prepare_guarded_pending;
     use super::read_pending;
     use super::state_root;
+    use super::write_execution_receipt;
     use super::write_pending;
 
     #[test]
@@ -624,6 +707,8 @@ PATCH"#;
 
         assert!(PathBuf::from(&pending.transaction_record_path).exists());
         assert_eq!(count_files(state_root(root).join("locks"), "lock"), 1);
+        let receipt_path = write_execution_receipt(&pending, true, 1, Vec::new());
+        assert!(receipt_path.as_ref().is_ok_and(|path| path.exists()));
         assert!(write_pending(&pending).is_ok());
         assert!(read_pending(root, "unit-1").is_ok_and(|pending| pending.is_some()));
 

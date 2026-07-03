@@ -15,6 +15,7 @@ Current plugin id: `safeguard@safeguard-local`.
 - Requires the old text fragment to appear exactly once before planning or applying an edit.
 - Enforces workspace-root containment for file edits.
 - Writes internal hook and MCP audit metadata to `.safeguard/audit.jsonl`.
+- Writes native edit execution receipts to `.safeguard/receipts/`.
 - Keeps hash/integrity metadata inside the plugin wrapper; normal model-facing responses do not expose digests.
 
 ## Repository Layout
@@ -61,8 +62,9 @@ Normal Codex editing should stay normal. The model can use native `apply_patch`;
 - `PreToolUse` creates a guarded transaction record and target lock set.
 - `PostToolUse` records after-digests and changed-file evidence.
 - `PostToolUse` completes the transaction and releases target locks.
+- `PostToolUse` writes an `ExecutionReceipt v0.1` for the guarded edit.
 - `PermissionRequest` denies risky direct shell writes in protect mode.
-- Internal digests are written to `.safeguard/audit.jsonl`, not to model context.
+- Internal digests are written to `.safeguard/audit.jsonl` and `.safeguard/receipts/`, not to model context.
 
 Policy mode:
 
@@ -83,7 +85,7 @@ Use Codex normally. Safeguard protects native edit paths through plugin hooks.
 
 Use `sg_dry` and `sg_apply` only when you explicitly want the MCP fallback/API for a deterministic text replacement. The tool rejects missing, empty, or ambiguous fragments.
 
-Audit records are stored locally in `.safeguard/audit.jsonl`. This file is ignored by git.
+Audit records are stored locally in `.safeguard/audit.jsonl`. Execution receipts are stored locally in `.safeguard/receipts/`. These files are ignored by git.
 
 ## AI Agent Instructions
 
