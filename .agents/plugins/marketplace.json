@@ -1,0 +1,20 @@
+{
+  "name": "safeguard-local",
+  "interface": {
+    "displayName": "Safeguard Local"
+  },
+  "plugins": [
+    {
+      "name": "safeguard",
+      "source": {
+        "source": "local",
+        "path": "./plugins/safeguard"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Developer Tools"
+    }
+  ]
+}

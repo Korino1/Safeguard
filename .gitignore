@@ -1,0 +1,35 @@
+.memory/
+.memoryx/
+.safeguard/
+.safeguard-test-*
+target/
+*.tmp
+*.bak
+*.log
+# Internal planning / orchestration artifacts
+AGENTS.md
+Concepts.txt
+gpt.txt
+IMPLEMENTATION_TRACKING.md
+NATIVE_CODEX_COMPATIBILITY_REQUIREMENTS.md
+SAFEGUARD_IMPLEMENTATION_PLAN.md
+SAFEGUARD_ORCHESTRATION_PLAN.md
+SAFEGUARD_PLUGIN_CONCEPT.md
+
+# Local Codex/MemoryX runtime state
+.codex/
+.memoryx/
+# Internal orchestration contracts and trackers
+contracts/
+scripts/checkpoint.ps1
+scripts/new_worklog_entry.ps1
+scripts/switch_phase.ps1
+scripts/validate_defect_ids.ps1
+scripts/validate_owner.ps1
+scripts/validate_phase_exit.ps1
+scripts/validate_worklog_size.ps1
+scripts/linux/
+# Internal validation reports with local machine paths
+SAFEGUARD_COMPATIBILITY_AUDIT.md
+docs/codex-integration.md
+
