@@ -100,36 +100,36 @@ fn tools_list_response(id: Value) -> Value {
         "result": {
             "tools": [
                 {
-                    "name": "safeguard_ping",
-                    "description": "Return a connectivity response proving the Rust Safeguard MCP server is reachable.",
+                    "name": "sg_ping",
+                    "description": "Ping Safeguard.",
                     "inputSchema": {
                         "type": "object",
                         "properties": {
                             "message": {
                                 "type": "string",
-                                "description": "Optional message to echo."
+                                "description": "Echo text."
                             }
                         },
                         "additionalProperties": false
                     }
                 },
                 {
-                    "name": "safeguard_plan_replace",
-                    "description": "Plan a deterministic text replacement only when the old fragment appears exactly once.",
+                    "name": "sg_plan",
+                    "description": "Plan one exact text replacement.",
                     "inputSchema": {
                         "type": "object",
                         "properties": {
                             "input": {
                                 "type": "string",
-                                "description": "Full input text."
+                                "description": "Full text."
                             },
                             "old": {
                                 "type": "string",
-                                "description": "Expected old fragment."
+                                "description": "Old fragment."
                             },
                             "new": {
                                 "type": "string",
-                                "description": "Replacement fragment."
+                                "description": "New fragment."
                             }
                         },
                         "required": ["input", "old", "new"],
@@ -137,22 +137,22 @@ fn tools_list_response(id: Value) -> Value {
                     }
                 },
                 {
-                    "name": "safeguard_dry_run_replace_file",
-                    "description": "Plan a guarded file replacement without writing.",
+                    "name": "sg_dry",
+                    "description": "Plan one file replacement.",
                     "inputSchema": {
                         "type": "object",
                         "properties": {
                             "path": {
                                 "type": "string",
-                                "description": "Target text file path."
+                                "description": "File path."
                             },
                             "old": {
                                 "type": "string",
-                                "description": "Expected old fragment."
+                                "description": "Old fragment."
                             },
                             "new": {
                                 "type": "string",
-                                "description": "Replacement fragment."
+                                "description": "New fragment."
                             }
                         },
                         "required": ["path", "old", "new"],
@@ -160,22 +160,22 @@ fn tools_list_response(id: Value) -> Value {
                     }
                 },
                 {
-                    "name": "safeguard_apply_replace_file",
-                    "description": "Apply a guarded file replacement only when the old fragment appears exactly once.",
+                    "name": "sg_apply",
+                    "description": "Apply one file replacement.",
                     "inputSchema": {
                         "type": "object",
                         "properties": {
                             "path": {
                                 "type": "string",
-                                "description": "Target text file path."
+                                "description": "File path."
                             },
                             "old": {
                                 "type": "string",
-                                "description": "Expected old fragment."
+                                "description": "Old fragment."
                             },
                             "new": {
                                 "type": "string",
-                                "description": "Replacement fragment."
+                                "description": "New fragment."
                             }
                         },
                         "required": ["path", "old", "new"],
@@ -183,14 +183,14 @@ fn tools_list_response(id: Value) -> Value {
                     }
                 },
                 {
-                    "name": "safeguard_audit_summary",
-                    "description": "Summarize recent Safeguard audit records with internal metadata omitted.",
+                    "name": "sg_audit",
+                    "description": "Show recent audit records.",
                     "inputSchema": {
                         "type": "object",
                         "properties": {
                             "limit": {
                                 "type": "integer",
-                                "description": "Maximum recent records to return."
+                                "description": "Record limit."
                             }
                         },
                         "additionalProperties": false
@@ -212,7 +212,7 @@ fn tools_call_response(id: Value, request: &Value) -> Value {
     let arguments = params.get("arguments").unwrap_or(&Value::Null);
 
     match tool_name {
-        "safeguard_ping" => {
+        "sg_ping" => {
             let message = arguments
                 .get("message")
                 .and_then(Value::as_str)
@@ -220,18 +220,15 @@ fn tools_call_response(id: Value, request: &Value) -> Value {
                 .unwrap_or("pong");
             tool_text(id, format!("safeguard: {message}"))
         }
-        "safeguard_plan_replace" => {
+        "sg_plan" => {
             let Some(input) = arguments.get("input").and_then(Value::as_str) else {
-                return invalid_params(
-                    id,
-                    "safeguard_plan_replace requires string argument 'input'",
-                );
+                return invalid_params(id, "sg_plan requires string argument 'input'");
             };
             let Some(old_fragment) = arguments.get("old").and_then(Value::as_str) else {
-                return invalid_params(id, "safeguard_plan_replace requires string argument 'old'");
+                return invalid_params(id, "sg_plan requires string argument 'old'");
             };
             let Some(new_fragment) = arguments.get("new").and_then(Value::as_str) else {
-                return invalid_params(id, "safeguard_plan_replace requires string argument 'new'");
+                return invalid_params(id, "sg_plan requires string argument 'new'");
             };
 
             match safeguard_core::plan_unique_replacement(input, old_fragment, new_fragment) {
@@ -257,7 +254,7 @@ fn tools_call_response(id: Value, request: &Value) -> Value {
                 Err(err) => tool_text(id, format!("rejected: {err:?}")),
             }
         }
-        "safeguard_dry_run_replace_file" => {
+        "sg_dry" => {
             let Some(args) = file_replace_args(id.clone(), arguments) else {
                 return invalid_params(
                     id,
@@ -275,7 +272,7 @@ fn tools_call_response(id: Value, request: &Value) -> Value {
                 Err(err) => tool_text(id, format!("rejected: {err}")),
             }
         }
-        "safeguard_apply_replace_file" => {
+        "sg_apply" => {
             let Some(args) = file_replace_args(id.clone(), arguments) else {
                 return invalid_params(
                     id,
@@ -290,7 +287,7 @@ fn tools_call_response(id: Value, request: &Value) -> Value {
 
             match safeguard_core::plan_text_file_replacement(&path, &args.old, &args.new) {
                 Ok(plan) => match safeguard_core::apply_text_file_replacement(&plan) {
-                    Ok(()) => match append_audit_record("safeguard_apply_replace_file", &plan) {
+                    Ok(()) => match append_audit_record("sg_apply", &plan) {
                         Ok(()) => replacement_plan_result(id, "applied", &plan),
                         Err(err) => tool_text(id, format!("applied; audit write failed: {err}")),
                     },
@@ -299,7 +296,7 @@ fn tools_call_response(id: Value, request: &Value) -> Value {
                 Err(err) => tool_text(id, format!("rejected: {err}")),
             }
         }
-        "safeguard_audit_summary" => {
+        "sg_audit" => {
             let limit = arguments
                 .get("limit")
                 .and_then(Value::as_u64)
@@ -514,7 +511,7 @@ mod tests {
     #[test]
     fn ping_returns_json_rpc_response() {
         let response = handle_line(
-            r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"safeguard_ping","arguments":{"message":"ok"}}}"#,
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"sg_ping","arguments":{"message":"ok"}}}"#,
         )
         .unwrap_or_default();
 
@@ -524,7 +521,7 @@ mod tests {
     #[test]
     fn plan_replace_rejects_ambiguous_input() {
         let response = handle_line(
-            r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"safeguard_plan_replace","arguments":{"input":"x x","old":"x","new":"y"}}}"#,
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"sg_plan","arguments":{"input":"x x","old":"x","new":"y"}}}"#,
         )
         .unwrap_or_default();
 
@@ -538,7 +535,7 @@ mod tests {
         assert!(write_result.is_ok());
 
         let request = format!(
-            r#"{{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{{"name":"safeguard_apply_replace_file","arguments":{{"path":{},"old":"beta","new":"BETA"}}}}}}"#,
+            r#"{{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{{"name":"sg_apply","arguments":{{"path":{},"old":"beta","new":"BETA"}}}}}}"#,
             serde_json::json!(path.display().to_string())
         );
         let response = handle_line(&request).unwrap_or_default();
@@ -566,14 +563,14 @@ mod tests {
         assert!(write_result.is_ok());
 
         let request = format!(
-            r#"{{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{{"name":"safeguard_apply_replace_file","arguments":{{"path":{},"old":"beta","new":"BETA"}}}}}}"#,
+            r#"{{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{{"name":"sg_apply","arguments":{{"path":{},"old":"beta","new":"BETA"}}}}}}"#,
             serde_json::json!(path.display().to_string())
         );
         let apply_response = handle_line(&request).unwrap_or_default();
         assert!(apply_response.contains(r#"\"status\":\"applied\""#));
 
         let summary_response = handle_line(
-            r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"safeguard_audit_summary","arguments":{"limit":1}}}"#,
+            r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"sg_audit","arguments":{"limit":1}}}"#,
         )
         .unwrap_or_default();
 

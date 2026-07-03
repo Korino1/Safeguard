@@ -49,15 +49,15 @@ Expected final state:
 
 ## MCP Tools
 
-- `safeguard_ping` - connectivity check.
-- `safeguard_plan_replace` - plans a unique in-memory text replacement.
-- `safeguard_dry_run_replace_file` - plans a guarded file replacement without writing.
-- `safeguard_apply_replace_file` - applies a guarded file replacement.
-- `safeguard_audit_summary` - returns recent audit records without internal digest fields.
+- `sg_ping` - connectivity check.
+- `sg_plan` - plans a unique in-memory text replacement.
+- `sg_dry` - plans a guarded file replacement without writing.
+- `sg_apply` - applies a guarded file replacement.
+- `sg_audit` - returns recent audit records without internal digest fields.
 
 ## Human Usage Pattern
 
-Use `safeguard_dry_run_replace_file` before applying a risky edit. The tool rejects missing, empty, or ambiguous fragments. Use `safeguard_apply_replace_file` only when the dry-run coordinates match the intended edit.
+Use `sg_dry` before applying a risky edit. The tool rejects missing, empty, or ambiguous fragments. Use `sg_apply` only when the dry-run coordinates match the intended edit.
 
 Audit records are stored locally in `.safeguard/audit.jsonl`. This file is ignored by git.
 
@@ -70,10 +70,10 @@ Agent rules:
 - Do not ask the model to reason over BLAKE3 or other internal digests.
 - Do not include internal hash metadata in prompts or normal summaries.
 - Treat hash/integrity checks as wrapper state owned by the MCP server.
-- Use `safeguard_dry_run_replace_file` before `safeguard_apply_replace_file` when edit risk is non-trivial.
+- Use `sg_dry` before `sg_apply` when edit risk is non-trivial.
 - If a replacement is rejected as ambiguous, narrow the old fragment with more surrounding context.
 - If a path is rejected as outside workspace root, do not bypass Safeguard with arbitrary shell writes unless the user explicitly asks for that path and understands the policy boundary.
-- Use `safeguard_audit_summary` for operation visibility; it intentionally omits digest fields.
+- Use `sg_audit` for operation visibility; it intentionally omits digest fields.
 
 ## Development Checks
 

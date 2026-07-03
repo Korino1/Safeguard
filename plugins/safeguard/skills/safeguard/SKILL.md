@@ -11,10 +11,10 @@ Use its MCP tools for deterministic guarded text replacements and audit summarie
 
 Expected MCP tools:
 
-- `safeguard_ping`
-- `safeguard_plan_replace`
-- `safeguard_dry_run_replace_file`
-- `safeguard_apply_replace_file`
-- `safeguard_audit_summary`
+- `sg_ping`
+- `sg_plan`
+- `sg_dry`
+- `sg_apply`
+- `sg_audit`
 
 Internal integrity metadata is wrapper state. Do not ask the model to reason over hashes or include digests in normal prompts.
