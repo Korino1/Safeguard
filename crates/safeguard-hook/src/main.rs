@@ -15,6 +15,13 @@ use serde_json::Value;
 use serde_json::json;
 
 fn main() -> anyhow::Result<()> {
+    let args = std::env::args().skip(1).collect::<Vec<_>>();
+    if args.first().is_some_and(|arg| arg == "recover") {
+        let output = handle_recover_cli(&args[1..]);
+        println!("{output}");
+        return Ok(());
+    }
+
     let mut input = String::new();
     std::io::stdin()
         .read_to_string(&mut input)
@@ -68,6 +75,86 @@ fn handle_hook(request: &HookRequest) -> Value {
         "PostToolUse" => post_tool_use(request),
         _ => continue_output(),
     }
+}
+
+fn handle_recover_cli(args: &[String]) -> Value {
+    let mut cwd = None;
+    let mut list = false;
+    let mut rollback = None;
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--cwd" => {
+                let Some(value) = args.get(index + 1) else {
+                    return recover_error("missing value for --cwd");
+                };
+                cwd = Some(value.clone());
+                index += 2;
+            }
+            "--list" => {
+                list = true;
+                index += 1;
+            }
+            "--rollback" => {
+                let Some(value) = args.get(index + 1) else {
+                    return recover_error("missing value for --rollback");
+                };
+                rollback = Some(value.clone());
+                index += 2;
+            }
+            _ => return recover_error("unknown recover argument"),
+        }
+    }
+
+    let cwd = cwd.unwrap_or_else(|| {
+        std::env::current_dir()
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|_| ".".to_string())
+    });
+    if list || rollback.is_none() {
+        return match safeguard_transaction::recovery_candidates(state_root(&cwd)) {
+            Ok(candidates) => json!({
+                "ok": true,
+                "operation": "list",
+                "count": candidates.len(),
+                "records": candidates
+                    .into_iter()
+                    .map(|candidate| candidate.record_path.display().to_string())
+                    .collect::<Vec<_>>()
+            }),
+            Err(err) => recover_error(&model_safe_transaction_error(err).to_string()),
+        };
+    }
+
+    let transaction_id = match rollback {
+        Some(value) => value,
+        None => return recover_error("missing transaction id"),
+    };
+    let id = match safeguard_transaction::TransactionId::new(transaction_id.clone()) {
+        Ok(id) => id,
+        Err(err) => return recover_error(&model_safe_transaction_error(err).to_string()),
+    };
+    match safeguard_transaction::rollback_transaction(state_root(&cwd), &id) {
+        Ok(Some(record)) => {
+            let receipt_path = write_recovery_receipt(&cwd, &transaction_id, &record).ok();
+            json!({
+                "ok": true,
+                "operation": "rollback",
+                "transaction_id": transaction_id,
+                "targets": record.targets.len(),
+                "receipt_path": receipt_path.map(|path| path.display().to_string())
+            })
+        }
+        Ok(None) => recover_error("transaction record not found"),
+        Err(err) => recover_error(&model_safe_transaction_error(err).to_string()),
+    }
+}
+
+fn recover_error(reason: &str) -> Value {
+    json!({
+        "ok": false,
+        "error": reason
+    })
 }
 
 fn pre_tool_use(request: &HookRequest) -> Value {
@@ -414,6 +501,78 @@ fn write_execution_receipt(
     Ok(path)
 }
 
+fn write_recovery_receipt(
+    cwd: &str,
+    transaction_id: &str,
+    record: &safeguard_transaction::TransactionRecord,
+) -> anyhow::Result<PathBuf> {
+    let receipt_id = format!("recovery-{}", safe_file_id(transaction_id));
+    let mut receipt = safeguard_protocol::ExecutionReceipt {
+        schema_version: safeguard_protocol::SCHEMA_VERSION_0_1.to_string(),
+        contract_id: transaction_id.to_string(),
+        receipt_id,
+        status: safeguard_protocol::ReceiptStatus::RolledBack,
+        started_at: format!("unix:{}", record.started_at),
+        completed_at: format!("unix:{}", current_unix_timestamp()),
+        executor: safeguard_protocol::ReceiptExecutor {
+            system: "safeguard-hook".to_string(),
+            version: env!("CARGO_PKG_VERSION").to_string(),
+        },
+        observed_operations: record
+            .targets
+            .iter()
+            .map(|target| safeguard_protocol::ObservedOperation {
+                tool: "safeguard-hook".to_string(),
+                operation: "recover.rollback".to_string(),
+                path: Some(target.path.display().to_string()),
+                command: None,
+            })
+            .collect(),
+        changed_files: record
+            .targets
+            .iter()
+            .map(|target| safeguard_protocol::ChangedFile {
+                path: target.path.display().to_string(),
+                operation: if target.existed_before {
+                    safeguard_protocol::FileOperation::Modify
+                } else {
+                    safeguard_protocol::FileOperation::Delete
+                },
+                before_digest: target.before_blake3.clone(),
+                after_digest: digest_path_if_exists(&target.path),
+                diff_digest: None,
+            })
+            .collect(),
+        validations: Vec::new(),
+        policy_violations: Vec::new(),
+        invariants: vec![safeguard_protocol::InvariantResult {
+            name: "rollback_completed".to_string(),
+            status: safeguard_protocol::InvariantStatus::Passed,
+        }],
+        receipt_hash: None,
+        previous_receipt_hash: None,
+        signature: None,
+        extensions: Default::default(),
+    };
+    let unsigned = serde_json::to_vec(&receipt)?;
+    receipt.receipt_hash = Some(safeguard_core::blake3_hex(&unsigned).as_hex().to_string());
+
+    let dir = state_root(cwd).join("receipts");
+    std::fs::create_dir_all(&dir)?;
+    let path = dir.join(format!("{}.json", safe_file_id(&receipt.receipt_id)));
+    std::fs::write(&path, serde_json::to_vec_pretty(&receipt)?)?;
+    Ok(path)
+}
+
+fn digest_path_if_exists(path: &Path) -> Option<String> {
+    if !path.exists() {
+        return None;
+    }
+    std::fs::read(path)
+        .ok()
+        .map(|bytes| safeguard_core::blake3_hex(&bytes).as_hex().to_string())
+}
+
 fn current_unix_timestamp() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -437,6 +596,9 @@ fn model_safe_transaction_error(err: safeguard_transaction::TransactionError) ->
         }
         safeguard_transaction::TransactionError::LockHeld { .. } => {
             "target is already locked by another guarded edit".to_string()
+        }
+        safeguard_transaction::TransactionError::MissingRollbackSnapshot { .. } => {
+            "rollback snapshot is missing for a guarded edit".to_string()
         }
         safeguard_transaction::TransactionError::Io { operation, .. } => {
             format!("guarded edit storage failed during {operation}")
@@ -637,6 +799,7 @@ mod tests {
     use std::path::PathBuf;
 
     use super::extract_patch;
+    use super::handle_recover_cli;
     use super::is_risky_shell_write;
     use super::patch_targets;
     use super::plan_patch_files;
@@ -721,6 +884,68 @@ PATCH"#;
         };
         assert!(safeguard_transaction::complete_transaction(state_root(root), &id).is_ok());
         assert_eq!(count_files(state_root(root).join("locks"), "lock"), 0);
+    }
+
+    #[test]
+    fn recover_cli_lists_and_rolls_back_transaction() {
+        let fixture = Fixture::new("recover_cli_lists_and_rolls_back_transaction");
+        let file = fixture.root.join("a.txt");
+        assert!(std::fs::write(&file, "alpha").is_ok());
+        let Some(root) = fixture.root.to_str() else {
+            assert_eq!(fixture.root.display().to_string(), "");
+            return;
+        };
+        let command = r#"apply_patch <<'PATCH'
+*** Begin Patch
+*** Update File: a.txt
+@@
+-alpha
++beta
+*** End Patch
+PATCH"#;
+        let files = match plan_patch_files(root, command) {
+            Ok(files) => files,
+            Err(err) => {
+                assert_eq!(err.to_string(), "");
+                return;
+            }
+        };
+        let pending =
+            match prepare_guarded_pending(root, "unit-rollback", "Bash", "bash_apply_patch", files)
+            {
+                Ok(pending) => pending,
+                Err(err) => {
+                    assert_eq!(err.to_string(), "");
+                    return;
+                }
+            };
+        assert!(std::fs::write(&file, "beta").is_ok());
+
+        let list_args = vec!["--cwd".to_string(), root.to_string(), "--list".to_string()];
+        let listed = handle_recover_cli(&list_args);
+        assert_eq!(
+            listed.get("ok").and_then(serde_json::Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            listed.get("count").and_then(serde_json::Value::as_u64),
+            Some(1)
+        );
+
+        let rollback_args = vec![
+            "--cwd".to_string(),
+            root.to_string(),
+            "--rollback".to_string(),
+            pending.transaction_id,
+        ];
+        let rolled_back = handle_recover_cli(&rollback_args);
+        assert_eq!(
+            rolled_back.get("ok").and_then(serde_json::Value::as_bool),
+            Some(true)
+        );
+        assert!(std::fs::read_to_string(&file).is_ok_and(|value| value == "alpha"));
+        assert_eq!(count_files(state_root(root).join("locks"), "lock"), 0);
+        assert_eq!(count_files(state_root(root).join("receipts"), "json"), 1);
     }
 
     fn count_files(dir: PathBuf, extension: &str) -> usize {

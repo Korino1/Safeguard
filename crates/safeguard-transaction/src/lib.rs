@@ -162,6 +162,11 @@ pub enum TransactionError {
         /// Lock file path.
         lock_path: PathBuf,
     },
+    /// Existing target has no rollback snapshot in the transaction record.
+    MissingRollbackSnapshot {
+        /// Target path.
+        path: PathBuf,
+    },
     /// I/O failure.
     Io {
         /// Operation being attempted.
@@ -210,6 +215,9 @@ impl fmt::Display for TransactionError {
                 path.display(),
                 lock_path.display()
             ),
+            Self::MissingRollbackSnapshot { path } => {
+                write!(f, "target {} has no rollback snapshot", path.display())
+            }
             Self::Io {
                 operation,
                 path,
@@ -405,6 +413,41 @@ pub fn complete_transaction(
     Ok(())
 }
 
+/// Roll back a persisted transaction from its stored snapshots, then release locks.
+pub fn rollback_transaction(
+    state_root: impl AsRef<Path>,
+    id: &TransactionId,
+) -> Result<Option<TransactionRecord>, TransactionError> {
+    let state_root = state_root.as_ref();
+    let Some(record) = load_transaction_record(state_root, id)? else {
+        return Ok(None);
+    };
+
+    for target in &record.targets {
+        if target.existed_before {
+            let Some(rollback_path) = &target.rollback_path else {
+                return Err(TransactionError::MissingRollbackSnapshot {
+                    path: target.path.clone(),
+                });
+            };
+            std::fs::copy(rollback_path, &target.path).map_err(|source| TransactionError::Io {
+                operation: "restore rollback snapshot",
+                path: target.path.clone(),
+                source,
+            })?;
+        } else if target.path.exists() {
+            std::fs::remove_file(&target.path).map_err(|source| TransactionError::Io {
+                operation: "remove newly created target",
+                path: target.path.clone(),
+                source,
+            })?;
+        }
+    }
+
+    complete_transaction(state_root, id)?;
+    Ok(Some(record))
+}
+
 fn canonicalize_existing(
     path: &Path,
     operation: &'static str,
@@ -579,6 +622,7 @@ mod tests {
     use super::complete_transaction;
     use super::load_transaction_record;
     use super::recovery_candidates;
+    use super::rollback_transaction;
     use super::targets_from_contract;
     use super::transaction_id_from_contract;
 
@@ -656,6 +700,48 @@ mod tests {
 
         let completed = complete_transaction(&fixture.state, &id);
         assert!(completed.is_ok());
+        assert!(!lock_path.exists());
+        assert!(
+            !fixture
+                .state
+                .join("transactions")
+                .join(format!("{}.json", id.as_str()))
+                .exists()
+        );
+    }
+
+    #[test]
+    fn rolls_back_persisted_transaction() {
+        let fixture = Fixture::new("rolls_back_persisted_transaction");
+        let file = fixture.workspace.join("a.txt");
+        assert!(std::fs::write(&file, "alpha").is_ok());
+        let id = valid_id("tx-rollback");
+
+        let guard = match begin_transaction(
+            &fixture.workspace,
+            &fixture.state,
+            id.clone(),
+            &[TransactionTarget {
+                path: PathBuf::from("a.txt"),
+                expected_blake3: None,
+            }],
+        ) {
+            Ok(guard) => guard,
+            Err(err) => {
+                assert_eq!(err.to_string(), "");
+                return;
+            }
+        };
+        let lock_path = fixture
+            .state
+            .join("locks")
+            .join(format!("{}.lock", guard.targets()[0].lock_key));
+        assert!(guard.persist_record_keep_locks().is_ok());
+        assert!(std::fs::write(&file, "beta").is_ok());
+
+        let rolled_back = rollback_transaction(&fixture.state, &id);
+        assert!(rolled_back.is_ok_and(|record| record.is_some()));
+        assert!(std::fs::read_to_string(&file).is_ok_and(|value| value == "alpha"));
         assert!(!lock_path.exists());
         assert!(
             !fixture

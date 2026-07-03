@@ -179,9 +179,10 @@ Implemented now:
 - initial transaction crate with locks, digest CAS, rollback snapshots, recovery candidate scan, and `ExecutionContract` target mapping;
 - hook-side implicit `ExecutionContract` binding for native `apply_patch`;
 - persistent transaction lifecycle across separate `PreToolUse` and `PostToolUse` hook processes;
-- hook-side `ExecutionReceipt v0.1` emission for guarded native edits.
+- hook-side `ExecutionReceipt v0.1` emission for guarded native edits;
+- explicit recovery CLI for listing interrupted transactions and rolling them back with recovery receipts.
 
 Next Safeguard implementation steps:
 
-- add receipt hash-chain continuity and explicit recovery receipts;
+- add receipt hash-chain continuity;
 - add evidence export summaries shaped so a future MemoryX/Cabal/Safeguard symbiosis project can ingest them without schema redesign.

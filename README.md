@@ -87,6 +87,17 @@ Use `sg_dry` and `sg_apply` only when you explicitly want the MCP fallback/API f
 
 Audit records are stored locally in `.safeguard/audit.jsonl`. Execution receipts are stored locally in `.safeguard/receipts/`. These files are ignored by git.
 
+## Recovery
+
+If a hook transaction is interrupted before `PostToolUse`, recovery is explicit:
+
+```powershell
+.\plugins\safeguard\bin\windows\safeguard-hook.exe recover --cwd <workspace> --list
+.\plugins\safeguard\bin\windows\safeguard-hook.exe recover --cwd <workspace> --rollback <transaction_id>
+```
+
+Rollback restores guarded targets from local snapshots, releases Safeguard locks, removes the transaction record, and writes a rollback receipt.
+
 ## AI Agent Instructions
 
 When Safeguard is available, use normal Codex edit flows. Do not switch to MCP tools for every edit.
