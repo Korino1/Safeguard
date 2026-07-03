@@ -1,5 +1,5 @@
 [package]
-name = "safeguard-mcp"
+name = "safeguard-hook"
 version = "1.1.0"
 edition.workspace = true
 license.workspace = true
@@ -12,6 +12,3 @@ anyhow.workspace = true
 safeguard-core = { path = "../safeguard-core" }
 serde.workspace = true
 serde_json.workspace = true
-
-
-

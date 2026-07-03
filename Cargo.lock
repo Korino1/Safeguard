@@ -115,8 +115,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "safeguard-hook"
+version = "1.1.0"
+dependencies = [
+ "anyhow",
+ "safeguard-core",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "safeguard-mcp"
-version = "1.0.1"
+version = "1.1.0"
 dependencies = [
  "anyhow",
  "safeguard-core",

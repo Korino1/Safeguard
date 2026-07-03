@@ -1,0 +1,43 @@
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "apply_patch|Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"${PLUGIN_ROOT}/bin/windows/safeguard-hook.exe\"",
+            "timeout": 10,
+            "statusMessage": "Safeguard checking edit policy"
+          }
+        ]
+      }
+    ],
+    "PermissionRequest": [
+      {
+        "matcher": "apply_patch|Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"${PLUGIN_ROOT}/bin/windows/safeguard-hook.exe\"",
+            "timeout": 10,
+            "statusMessage": "Safeguard checking permission policy"
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "apply_patch|Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"${PLUGIN_ROOT}/bin/windows/safeguard-hook.exe\"",
+            "timeout": 10,
+            "statusMessage": "Safeguard auditing edit"
+          }
+        ]
+      }
+    ]
+  }
+}
