@@ -183,9 +183,9 @@ Implemented now:
 - persistent transaction lifecycle across separate `PreToolUse` and `PostToolUse` hook processes;
 - hook-side `ExecutionReceipt v0.1` emission for guarded native edits;
 - receipt-level expected add/modify/delete result verification;
+- local receipt hash-chain continuity through `previous_receipt_hash`;
 - explicit recovery CLI for listing interrupted transactions and rolling them back with recovery receipts.
 
 Next Safeguard implementation steps:
 
-- add receipt hash-chain continuity;
 - add evidence export summaries shaped so a future MemoryX/Cabal/Safeguard symbiosis project can ingest them without schema redesign.

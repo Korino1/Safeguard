@@ -659,7 +659,7 @@ fn write_execution_receipt(
             },
         ],
         receipt_hash: None,
-        previous_receipt_hash: None,
+        previous_receipt_hash: latest_receipt_hash(&pending.cwd),
         signature: None,
         extensions: Default::default(),
     };
@@ -734,7 +734,7 @@ fn write_recovery_receipt(
             status: safeguard_protocol::InvariantStatus::Passed,
         }],
         receipt_hash: None,
-        previous_receipt_hash: None,
+        previous_receipt_hash: latest_receipt_hash(cwd),
         signature: None,
         extensions: Default::default(),
     };
@@ -755,6 +755,25 @@ fn digest_path_if_exists(path: &Path) -> Option<String> {
     std::fs::read(path)
         .ok()
         .map(|bytes| safeguard_core::blake3_hex(&bytes).as_hex().to_string())
+}
+
+fn latest_receipt_hash(cwd: &str) -> Option<String> {
+    let dir = state_root(cwd).join("receipts");
+    let entries = std::fs::read_dir(dir).ok()?;
+    let mut paths = entries
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().and_then(|value| value.to_str()) == Some("json"))
+        .collect::<Vec<_>>();
+    paths.sort();
+    paths.into_iter().rev().find_map(|path| {
+        let bytes = std::fs::read(path).ok()?;
+        let value: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+        value
+            .get("receipt_hash")
+            .and_then(serde_json::Value::as_str)
+            .map(ToString::to_string)
+    })
 }
 
 fn current_unix_timestamp() -> u64 {
@@ -1059,6 +1078,17 @@ PATCH"#;
         assert_eq!(count_files(state_root(root).join("locks"), "lock"), 1);
         let receipt_path = write_execution_receipt(&pending, true, true, 1, Vec::new());
         assert!(receipt_path.as_ref().is_ok_and(|path| path.exists()));
+        let first_hash = receipt_path
+            .as_ref()
+            .ok()
+            .and_then(|path| receipt_field(path, "receipt_hash"));
+        let second_receipt_path = write_execution_receipt(&pending, true, true, 1, Vec::new());
+        let previous_hash = second_receipt_path
+            .as_ref()
+            .ok()
+            .and_then(|path| receipt_field(path, "previous_receipt_hash"));
+        assert!(first_hash.is_some());
+        assert_eq!(previous_hash, first_hash);
         assert!(write_pending(&pending).is_ok());
         assert!(read_pending(root, "unit-1").is_ok_and(|pending| pending.is_some()));
 
@@ -1226,6 +1256,15 @@ PATCH"#;
                 entry.path().extension().and_then(|value| value.to_str()) == Some(extension)
             })
             .count()
+    }
+
+    fn receipt_field(path: &PathBuf, field: &str) -> Option<String> {
+        let bytes = std::fs::read(path).ok()?;
+        let value: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+        value
+            .get(field)
+            .and_then(serde_json::Value::as_str)
+            .map(ToString::to_string)
     }
 
     struct Fixture {
