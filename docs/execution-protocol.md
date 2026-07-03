@@ -182,10 +182,10 @@ Implemented now:
 - hook-side capability, expected-file, and denied-resource enforcement for explicit contracts;
 - persistent transaction lifecycle across separate `PreToolUse` and `PostToolUse` hook processes;
 - hook-side `ExecutionReceipt v0.1` emission for guarded native edits;
+- receipt-level expected add/modify/delete result verification;
 - explicit recovery CLI for listing interrupted transactions and rolling them back with recovery receipts.
 
 Next Safeguard implementation steps:
 
-- add stricter result verification comparing authorized, expected, and actual changes;
 - add receipt hash-chain continuity;
 - add evidence export summaries shaped so a future MemoryX/Cabal/Safeguard symbiosis project can ingest them without schema redesign.

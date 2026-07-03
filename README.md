@@ -63,6 +63,7 @@ Normal Codex editing should stay normal. The model can use native `apply_patch`;
 - `PostToolUse` records after-digests and changed-file evidence.
 - `PostToolUse` completes the transaction and releases target locks.
 - `PostToolUse` writes an `ExecutionReceipt v0.1` for the guarded edit.
+- Receipt acceptance requires both tool success and expected add/modify/delete result verification.
 - `PermissionRequest` denies risky direct shell writes in protect mode.
 - Internal digests are written to `.safeguard/audit.jsonl` and `.safeguard/receipts/`, not to model context.
 

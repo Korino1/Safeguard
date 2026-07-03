@@ -281,8 +281,10 @@ fn post_tool_use(request: &HookRequest) -> Value {
         .unwrap_or(false);
     let mut files = Vec::new();
     let mut changed_files = Vec::new();
+    let mut expected_result_verified = true;
     for file in &pending.files {
         let path = PathBuf::from(&file.path);
+        let exists_after = path.exists();
         let after_blake3 = if path.exists() {
             match std::fs::read(&path) {
                 Ok(bytes) => Some(safeguard_core::blake3_hex(&bytes).as_hex().to_string()),
@@ -291,11 +293,14 @@ fn post_tool_use(request: &HookRequest) -> Value {
         } else {
             None
         };
+        let file_verified = expected_result_matches(file, exists_after, after_blake3.as_deref());
+        expected_result_verified &= file_verified;
         files.push(json!({
             "path": file.path,
             "operation": file.operation,
             "existed_before": file.existed_before,
-            "exists_after": path.exists(),
+            "exists_after": exists_after,
+            "verified": file_verified,
             "before_blake3": file.before_blake3,
             "after_blake3": after_blake3
         }));
@@ -308,7 +313,13 @@ fn post_tool_use(request: &HookRequest) -> Value {
         });
     }
     let started_at = transaction_started_at(&pending).unwrap_or_else(current_unix_timestamp);
-    let _ = write_execution_receipt(&pending, success, started_at, changed_files);
+    let _ = write_execution_receipt(
+        &pending,
+        success,
+        expected_result_verified,
+        started_at,
+        changed_files,
+    );
 
     let _ = append_policy_audit(
         &pending.cwd,
@@ -320,6 +331,7 @@ fn post_tool_use(request: &HookRequest) -> Value {
             "contract_id": pending.contract_id,
             "transaction_id": pending.transaction_id,
             "success": success,
+            "verified": expected_result_verified,
             "files": files
         }),
     );
@@ -596,6 +608,7 @@ fn transaction_started_at(pending: &PendingEdit) -> Option<u64> {
 fn write_execution_receipt(
     pending: &PendingEdit,
     success: bool,
+    expected_result_verified: bool,
     started_at: u64,
     changed_files: Vec<safeguard_protocol::ChangedFile>,
 ) -> anyhow::Result<PathBuf> {
@@ -604,7 +617,7 @@ fn write_execution_receipt(
         schema_version: safeguard_protocol::SCHEMA_VERSION_0_1.to_string(),
         contract_id: pending.contract_id.clone(),
         receipt_id,
-        status: if success {
+        status: if success && expected_result_verified {
             safeguard_protocol::ReceiptStatus::Accepted
         } else {
             safeguard_protocol::ReceiptStatus::Rejected
@@ -627,14 +640,24 @@ fn write_execution_receipt(
         changed_files,
         validations: Vec::new(),
         policy_violations: Vec::new(),
-        invariants: vec![safeguard_protocol::InvariantResult {
-            name: "transaction_completed".to_string(),
-            status: if success {
-                safeguard_protocol::InvariantStatus::Passed
-            } else {
-                safeguard_protocol::InvariantStatus::Failed
+        invariants: vec![
+            safeguard_protocol::InvariantResult {
+                name: "transaction_completed".to_string(),
+                status: if success {
+                    safeguard_protocol::InvariantStatus::Passed
+                } else {
+                    safeguard_protocol::InvariantStatus::Failed
+                },
             },
-        }],
+            safeguard_protocol::InvariantResult {
+                name: "expected_result".to_string(),
+                status: if expected_result_verified {
+                    safeguard_protocol::InvariantStatus::Passed
+                } else {
+                    safeguard_protocol::InvariantStatus::Failed
+                },
+            },
+        ],
         receipt_hash: None,
         previous_receipt_hash: None,
         signature: None,
@@ -648,6 +671,18 @@ fn write_execution_receipt(
     let path = dir.join(format!("{}.json", safe_file_id(&receipt.receipt_id)));
     std::fs::write(&path, serde_json::to_vec_pretty(&receipt)?)?;
     Ok(path)
+}
+
+fn expected_result_matches(
+    file: &PendingFile,
+    exists_after: bool,
+    after_blake3: Option<&str>,
+) -> bool {
+    match file.operation.as_str() {
+        "add" => !file.existed_before && exists_after && after_blake3.is_some(),
+        "delete" => file.existed_before && !exists_after,
+        _ => file.existed_before && exists_after && file.before_blake3.as_deref() != after_blake3,
+    }
 }
 
 fn write_recovery_receipt(
@@ -948,6 +983,7 @@ mod tests {
     use std::path::PathBuf;
 
     use super::enforce_explicit_contract;
+    use super::expected_result_matches;
     use super::extract_patch;
     use super::handle_recover_cli;
     use super::implicit_contract;
@@ -1021,7 +1057,7 @@ PATCH"#;
 
         assert!(PathBuf::from(&pending.transaction_record_path).exists());
         assert_eq!(count_files(state_root(root).join("locks"), "lock"), 1);
-        let receipt_path = write_execution_receipt(&pending, true, 1, Vec::new());
+        let receipt_path = write_execution_receipt(&pending, true, true, 1, Vec::new());
         assert!(receipt_path.as_ref().is_ok_and(|path| path.exists()));
         assert!(write_pending(&pending).is_ok());
         assert!(read_pending(root, "unit-1").is_ok_and(|pending| pending.is_some()));
@@ -1148,6 +1184,36 @@ PATCH"#;
         let enforced =
             enforce_explicit_contract(root, "Bash", "bash_apply_patch", &attempted, contract);
         assert!(enforced.is_err());
+    }
+
+    #[test]
+    fn verifies_expected_file_results() {
+        let modified = super::PendingFile {
+            path: "a.txt".to_string(),
+            operation: "update".to_string(),
+            existed_before: true,
+            before_blake3: Some("old".to_string()),
+        };
+        assert!(expected_result_matches(&modified, true, Some("new")));
+        assert!(!expected_result_matches(&modified, true, Some("old")));
+
+        let added = super::PendingFile {
+            path: "b.txt".to_string(),
+            operation: "add".to_string(),
+            existed_before: false,
+            before_blake3: None,
+        };
+        assert!(expected_result_matches(&added, true, Some("new")));
+        assert!(!expected_result_matches(&added, false, None));
+
+        let deleted = super::PendingFile {
+            path: "c.txt".to_string(),
+            operation: "delete".to_string(),
+            existed_before: true,
+            before_blake3: Some("old".to_string()),
+        };
+        assert!(expected_result_matches(&deleted, false, None));
+        assert!(!expected_result_matches(&deleted, true, Some("old")));
     }
 
     fn count_files(dir: PathBuf, extension: &str) -> usize {
