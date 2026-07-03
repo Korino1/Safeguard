@@ -1,6 +1,6 @@
 {
   "name": "safeguard",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "description": "External Safeguard plugin for guarded Codex CLI file edits.",
   "author": {
     "name": "Safeguard Project"
@@ -20,7 +20,7 @@
   "interface": {
     "displayName": "Safeguard",
     "shortDescription": "Guarded file editing tools for Codex CLI.",
-    "longDescription": "A native-compatible external Codex plugin with a bundled Rust MCP server for guarded text replacements, workspace path policy, and internal audit metadata.",
+    "longDescription": "A native-compatible external Codex plugin with Rust lifecycle hooks, guarded edit transactions, execution receipts, evidence summaries, and a bundled MCP fallback server.",
     "developerName": "Safeguard Project",
     "category": "Developer Tools",
     "capabilities": [

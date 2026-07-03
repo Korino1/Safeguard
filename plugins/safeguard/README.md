@@ -33,6 +33,17 @@ Expected MCP server name: `safeguard`.
 
 The plugin also installs lifecycle hooks for native `apply_patch` and shell write policy. Codex may ask you to trust the hook before it runs.
 
+The hook layer wraps native patch edits in local transactions, writes execution receipts under `.safeguard/receipts/`, writes MemoryX-shaped evidence summaries under `.safeguard/evidence/`, and keeps hashes out of normal model-facing output.
+
+Interrupted transactions can be inspected and rolled back explicitly:
+
+```powershell
+.\plugins\safeguard\bin\windows\safeguard-hook.exe recover --cwd <workspace> --list
+.\plugins\safeguard\bin\windows\safeguard-hook.exe recover --cwd <workspace> --rollback <transaction_id>
+```
+
+An orchestrator can provide an explicit `ExecutionContract v0.1` file through `SAFEGUARD_CONTRACT_PATH`; otherwise the hook creates an implicit local contract for native patches.
+
 Linux host build:
 
 ```bash
