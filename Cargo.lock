@@ -135,11 +135,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "safeguard-protocol"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "safeguard-transaction"
 version = "0.1.0"
 dependencies = [
  "anyhow",
  "safeguard-core",
+ "safeguard-protocol",
  "serde",
  "serde_json",
 ]

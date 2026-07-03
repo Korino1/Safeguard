@@ -1,5 +1,5 @@
 [package]
-name = "safeguard-transaction"
+name = "safeguard-protocol"
 version = "0.1.0"
 edition.workspace = true
 license.workspace = true
@@ -8,8 +8,5 @@ license.workspace = true
 workspace = true
 
 [dependencies]
-anyhow.workspace = true
-safeguard-core = { path = "../safeguard-core" }
-safeguard-protocol = { path = "../safeguard-protocol" }
 serde.workspace = true
 serde_json.workspace = true

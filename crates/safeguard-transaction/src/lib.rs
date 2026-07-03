@@ -12,6 +12,8 @@ use std::time::UNIX_EPOCH;
 use serde::Deserialize;
 use serde::Serialize;
 
+use safeguard_protocol::ExecutionContract;
+
 /// Transaction identifier supplied by the caller or orchestrator layer.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct TransactionId(String);
@@ -303,6 +305,26 @@ pub fn begin_transaction(
     })
 }
 
+/// Build a transaction id from a shared execution contract.
+pub fn transaction_id_from_contract(
+    contract: &ExecutionContract,
+) -> Result<TransactionId, TransactionError> {
+    TransactionId::new(contract.contract_id.clone())
+}
+
+/// Convert shared execution contract expected files into transaction targets.
+pub fn targets_from_contract(contract: &ExecutionContract) -> Vec<TransactionTarget> {
+    contract
+        .expected_changes
+        .files
+        .iter()
+        .map(|file| TransactionTarget {
+            path: PathBuf::from(&file.path),
+            expected_blake3: file.before_digest.clone(),
+        })
+        .collect()
+}
+
 /// List transaction records that may need recovery handling after a crash.
 pub fn recovery_candidates(
     state_root: impl AsRef<Path>,
@@ -464,12 +486,17 @@ mod tests {
     use std::path::PathBuf;
 
     use safeguard_core::blake3_hex;
+    use safeguard_protocol::ExecutionContract;
+    use safeguard_protocol::ExpectedFileChange;
+    use safeguard_protocol::FileOperation;
 
     use super::TransactionError;
     use super::TransactionId;
     use super::TransactionTarget;
     use super::begin_transaction;
     use super::recovery_candidates;
+    use super::targets_from_contract;
+    use super::transaction_id_from_contract;
 
     #[test]
     fn begins_transaction_and_writes_rollback_snapshot() {
@@ -586,6 +613,28 @@ mod tests {
             err,
             Err(TransactionError::PathOutsideWorkspace { .. })
         ));
+    }
+
+    #[test]
+    fn converts_execution_contract_to_transaction_inputs() {
+        let mut contract = ExecutionContract::v0_1("task-1842");
+        contract.expected_changes.files.push(ExpectedFileChange {
+            path: "src/lib.rs".to_string(),
+            operation: FileOperation::Modify,
+            before_digest: Some("digest-before".to_string()),
+            expected_diff_digest: None,
+        });
+
+        let id = transaction_id_from_contract(&contract);
+        assert!(id.is_ok());
+        let targets = targets_from_contract(&contract);
+
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].path, PathBuf::from("src/lib.rs"));
+        assert_eq!(
+            targets[0].expected_blake3,
+            Some("digest-before".to_string())
+        );
     }
 
     #[cfg(unix)]

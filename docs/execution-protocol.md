@@ -6,13 +6,15 @@ This document defines the shared execution protocol principles that Safeguard, C
 
 Safeguard is the lower trusted execution layer. Cabal is expected to plan and produce contracts. MemoryX is expected to store contract grounds and receipts as durable evidence.
 
-The protocol exists to prevent each separate project from inventing incompatible task, evidence, audit, and receipt structures. The combined Cabal + MemoryX + Safeguard system is a separate future project; this document only defines the common principles and wire shapes needed for that later symbiosis.
+The protocol exists to prevent each separate project from inventing incompatible task, evidence, audit, and receipt structures. The combined Cabal + MemoryX + Safeguard system is a separate future integration target; this document only defines common principles and wire shapes, not a merged implementation, shared runtime, or shared codebase.
 
 ## Transparency Rule
 
 The protocol is not normal model context.
 
 Coding models should continue to use native Codex workflows. Safeguard hooks and policy layers enforce contracts transparently. Model-facing output should be limited to normal success, concise failure reasons, or explicit user-requested audit summaries.
+
+The protocol must remain auditable and inspectable when explicitly requested, but it must not be injected into ordinary model context as recurring operational burden.
 
 ## System Loop
 
