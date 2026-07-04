@@ -116,7 +116,7 @@ dependencies = [
 
 [[package]]
 name = "safeguard-hook"
-version = "1.3.2"
+version = "1.3.3"
 dependencies = [
  "anyhow",
  "safeguard-core",
@@ -128,7 +128,7 @@ dependencies = [
 
 [[package]]
 name = "safeguard-mcp"
-version = "1.3.2"
+version = "1.3.3"
 dependencies = [
  "anyhow",
  "safeguard-core",

@@ -196,11 +196,11 @@ fn recover_error(reason: &str) -> Value {
 
 fn pre_tool_use(request: &HookRequest) -> Value {
     let tool_name = request.tool_name.as_deref().unwrap_or_default();
-    if tool_name.starts_with("mcp__safeguard__") {
+    if is_safeguard_mcp_tool(tool_name) {
         return continue_output();
     }
 
-    if tool_name == "apply_patch" {
+    if is_apply_patch_tool(tool_name) {
         return match command_text(&request.tool_input)
             .and_then(|command| plan_patch_files(&request.cwd, command).ok())
         {
@@ -230,7 +230,7 @@ fn pre_tool_use(request: &HookRequest) -> Value {
         };
     }
 
-    if tool_name == "Bash" {
+    if is_shell_tool(tool_name) {
         let command = command_text(&request.tool_input).unwrap_or_default();
         if command.contains("apply_patch") {
             return match plan_patch_files(&request.cwd, command) {
@@ -284,12 +284,12 @@ fn pre_tool_use(request: &HookRequest) -> Value {
 
 fn permission_request(request: &HookRequest) -> Value {
     let tool_name = request.tool_name.as_deref().unwrap_or_default();
-    if tool_name == "apply_patch" {
+    if is_apply_patch_tool(tool_name) {
         return continue_output();
     }
 
     let command = command_text(&request.tool_input).unwrap_or_default();
-    if tool_name == "Bash" && is_risky_shell_write(command) && safeguard_mode() != "monitor" {
+    if is_shell_tool(tool_name) && is_risky_shell_write(command) && safeguard_mode() != "monitor" {
         return json!({
             "continue": true,
             "hookSpecificOutput": {
@@ -648,6 +648,27 @@ fn command_text(tool_input: &Value) -> Option<&str> {
         .get("command")
         .and_then(Value::as_str)
         .or_else(|| tool_input.get("cmd").and_then(Value::as_str))
+        .or_else(|| tool_input.get("patch").and_then(Value::as_str))
+}
+
+fn is_safeguard_mcp_tool(tool_name: &str) -> bool {
+    tool_name.starts_with("mcp__safeguard__")
+        || tool_name.starts_with("sg_")
+        || tool_name.contains("safeguard")
+}
+
+fn is_apply_patch_tool(tool_name: &str) -> bool {
+    tool_name == "apply_patch"
+        || tool_name.ends_with(".apply_patch")
+        || tool_name.ends_with("__apply_patch")
+}
+
+fn is_shell_tool(tool_name: &str) -> bool {
+    matches!(tool_name, "Bash" | "Shell" | "exec_command" | "shell")
+        || tool_name.ends_with(".exec_command")
+        || tool_name.ends_with("__exec_command")
+        || tool_name.ends_with(".shell")
+        || tool_name.ends_with("__shell")
 }
 
 fn safeguard_mode() -> String {
@@ -2051,6 +2072,66 @@ PATCH"#;
 
         assert!(pre_tool_use_denied(&output));
         assert!(read_pending(root, "unknown-tool-use").is_ok_and(|pending| pending.is_none()));
+    }
+
+    #[test]
+    fn pre_tool_use_namespaced_apply_patch_internal_state_is_denied() {
+        let fixture = Fixture::new("pre_tool_use_namespaced_apply_patch_internal_state_is_denied");
+        let Some(root) = fixture.root.to_str() else {
+            assert_eq!(fixture.root.display().to_string(), "");
+            return;
+        };
+        let patch = r#"*** Begin Patch
+*** Add File: .safeguard/live-block-test.txt
++blocked
+*** End Patch
+"#;
+        let request = super::HookRequest {
+            cwd: root.to_string(),
+            hook_event_name: "PreToolUse".to_string(),
+            tool_name: Some("functions.apply_patch".to_string()),
+            tool_input: serde_json::json!({ "patch": patch }),
+            tool_response: serde_json::Value::Null,
+            tool_use_id: Some("namespaced-apply-patch".to_string()),
+        };
+
+        let output = super::pre_tool_use(&request);
+
+        assert!(pre_tool_use_denied(&output));
+        assert!(
+            read_pending(root, "namespaced-apply-patch").is_ok_and(|pending| pending.is_none())
+        );
+    }
+
+    #[test]
+    fn pre_tool_use_namespaced_exec_apply_patch_internal_state_is_denied() {
+        let fixture =
+            Fixture::new("pre_tool_use_namespaced_exec_apply_patch_internal_state_is_denied");
+        let Some(root) = fixture.root.to_str() else {
+            assert_eq!(fixture.root.display().to_string(), "");
+            return;
+        };
+        let command = r#"apply_patch <<'PATCH'
+*** Begin Patch
+*** Add File: .safeguard/live-block-test.txt
++blocked
+*** End Patch
+PATCH"#;
+        let request = super::HookRequest {
+            cwd: root.to_string(),
+            hook_event_name: "PreToolUse".to_string(),
+            tool_name: Some("functions.exec_command".to_string()),
+            tool_input: serde_json::json!({ "cmd": command }),
+            tool_response: serde_json::Value::Null,
+            tool_use_id: Some("namespaced-exec-command".to_string()),
+        };
+
+        let output = super::pre_tool_use(&request);
+
+        assert!(pre_tool_use_denied(&output));
+        assert!(
+            read_pending(root, "namespaced-exec-command").is_ok_and(|pending| pending.is_none())
+        );
     }
 
     #[test]

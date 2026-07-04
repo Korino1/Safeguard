@@ -2,7 +2,6 @@
   "hooks": {
     "PreToolUse": [
       {
-        "matcher": "apply_patch|Bash",
         "hooks": [
           {
             "type": "command",
@@ -15,7 +14,6 @@
     ],
     "PermissionRequest": [
       {
-        "matcher": "apply_patch|Bash",
         "hooks": [
           {
             "type": "command",
@@ -28,7 +26,6 @@
     ],
     "PostToolUse": [
       {
-        "matcher": "apply_patch|Bash",
         "hooks": [
           {
             "type": "command",
