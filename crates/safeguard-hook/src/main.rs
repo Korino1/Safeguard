@@ -70,6 +70,15 @@ struct PendingFile {
     before_blake3: Option<String>,
 }
 
+#[derive(Debug, Clone)]
+struct ReceiptOutcome {
+    status: safeguard_protocol::ReceiptStatus,
+    tool_success: bool,
+    expected_result_verified: bool,
+    rollback_completed: Option<bool>,
+    completion_error: Option<String>,
+}
+
 fn handle_hook(request: &HookRequest) -> Value {
     match request.hook_event_name.as_str() {
         "PreToolUse" => pre_tool_use(request),
@@ -315,10 +324,60 @@ fn post_tool_use(request: &HookRequest) -> Value {
         });
     }
     let started_at = transaction_started_at(&pending).unwrap_or_else(current_unix_timestamp);
+    let accepted = success && expected_result_verified;
+    let mut receipt_status = if accepted {
+        safeguard_protocol::ReceiptStatus::Accepted
+    } else {
+        safeguard_protocol::ReceiptStatus::RolledBack
+    };
+    let mut rollback_completed = None;
+    let mut completion_error = None;
+
+    match safeguard_transaction::TransactionId::new(pending.transaction_id.clone()) {
+        Ok(id) if accepted => {
+            if let Err(err) =
+                safeguard_transaction::complete_transaction(state_root(&pending.cwd), &id)
+            {
+                receipt_status = safeguard_protocol::ReceiptStatus::Partial;
+                completion_error = Some(model_safe_transaction_error(err).to_string());
+                let _ = write_quarantine_marker(&pending, "commit_failed");
+            }
+        }
+        Ok(id) => {
+            match safeguard_transaction::rollback_transaction(state_root(&pending.cwd), &id) {
+                Ok(Some(_record)) => {
+                    rollback_completed = Some(true);
+                }
+                Ok(None) => {
+                    receipt_status = safeguard_protocol::ReceiptStatus::Partial;
+                    rollback_completed = Some(false);
+                    completion_error = Some("transaction record not found".to_string());
+                    let _ = write_quarantine_marker(&pending, "rollback_record_missing");
+                }
+                Err(err) => {
+                    receipt_status = safeguard_protocol::ReceiptStatus::Partial;
+                    rollback_completed = Some(false);
+                    completion_error = Some(model_safe_transaction_error(err).to_string());
+                    let _ = write_quarantine_marker(&pending, "rollback_failed");
+                }
+            }
+        }
+        Err(err) => {
+            receipt_status = safeguard_protocol::ReceiptStatus::Partial;
+            completion_error = Some(model_safe_transaction_error(err).to_string());
+            let _ = write_quarantine_marker(&pending, "invalid_transaction_id");
+        }
+    }
+
     let _ = write_execution_receipt(
         &pending,
-        success,
-        expected_result_verified,
+        ReceiptOutcome {
+            status: receipt_status.clone(),
+            tool_success: success,
+            expected_result_verified,
+            rollback_completed,
+            completion_error: completion_error.clone(),
+        },
         started_at,
         changed_files,
     );
@@ -334,13 +393,14 @@ fn post_tool_use(request: &HookRequest) -> Value {
             "transaction_id": pending.transaction_id,
             "success": success,
             "verified": expected_result_verified,
+            "receipt_status": format!("{:?}", receipt_status),
+            "completion_error": completion_error,
             "files": files
         }),
     );
-    if let Ok(id) = safeguard_transaction::TransactionId::new(pending.transaction_id.clone()) {
-        let _ = safeguard_transaction::complete_transaction(state_root(&pending.cwd), &id);
+    if receipt_status != safeguard_protocol::ReceiptStatus::Partial {
+        let _ = remove_pending(&request.cwd, tool_use_id);
     }
-    let _ = remove_pending(&request.cwd, tool_use_id);
     continue_output()
 }
 
@@ -616,21 +676,53 @@ fn transaction_started_at(pending: &PendingEdit) -> Option<u64> {
 
 fn write_execution_receipt(
     pending: &PendingEdit,
-    success: bool,
-    expected_result_verified: bool,
+    outcome: ReceiptOutcome,
     started_at: u64,
     changed_files: Vec<safeguard_protocol::ChangedFile>,
 ) -> anyhow::Result<PathBuf> {
     let receipt_id = format!("receipt-{}", safe_file_id(&pending.tool_use_id));
+    let mut invariants = vec![
+        safeguard_protocol::InvariantResult {
+            name: "transaction_completed".to_string(),
+            status: if outcome.tool_success {
+                safeguard_protocol::InvariantStatus::Passed
+            } else {
+                safeguard_protocol::InvariantStatus::Failed
+            },
+        },
+        safeguard_protocol::InvariantResult {
+            name: "expected_result".to_string(),
+            status: if outcome.expected_result_verified {
+                safeguard_protocol::InvariantStatus::Passed
+            } else {
+                safeguard_protocol::InvariantStatus::Failed
+            },
+        },
+    ];
+    if let Some(completed) = outcome.rollback_completed {
+        invariants.push(safeguard_protocol::InvariantResult {
+            name: "rollback_completed".to_string(),
+            status: if completed {
+                safeguard_protocol::InvariantStatus::Passed
+            } else {
+                safeguard_protocol::InvariantStatus::Failed
+            },
+        });
+    }
+    let policy_violations = outcome
+        .completion_error
+        .map(|reason| {
+            vec![safeguard_protocol::PolicyViolation {
+                code: "transaction_completion_failed".to_string(),
+                reason,
+            }]
+        })
+        .unwrap_or_default();
     let mut receipt = safeguard_protocol::ExecutionReceipt {
         schema_version: safeguard_protocol::SCHEMA_VERSION_0_1.to_string(),
         contract_id: pending.contract_id.clone(),
         receipt_id,
-        status: if success && expected_result_verified {
-            safeguard_protocol::ReceiptStatus::Accepted
-        } else {
-            safeguard_protocol::ReceiptStatus::Rejected
-        },
+        status: outcome.status,
         started_at: format!("unix:{started_at}"),
         completed_at: format!("unix:{}", current_unix_timestamp()),
         executor: safeguard_protocol::ReceiptExecutor {
@@ -648,25 +740,8 @@ fn write_execution_receipt(
             .collect(),
         changed_files,
         validations: Vec::new(),
-        policy_violations: Vec::new(),
-        invariants: vec![
-            safeguard_protocol::InvariantResult {
-                name: "transaction_completed".to_string(),
-                status: if success {
-                    safeguard_protocol::InvariantStatus::Passed
-                } else {
-                    safeguard_protocol::InvariantStatus::Failed
-                },
-            },
-            safeguard_protocol::InvariantResult {
-                name: "expected_result".to_string(),
-                status: if expected_result_verified {
-                    safeguard_protocol::InvariantStatus::Passed
-                } else {
-                    safeguard_protocol::InvariantStatus::Failed
-                },
-            },
-        ],
+        policy_violations,
+        invariants,
         receipt_hash: None,
         previous_receipt_hash: latest_receipt_hash(&pending.cwd),
         signature: None,
@@ -728,6 +803,21 @@ fn write_memoryx_evidence(
     std::fs::create_dir_all(&dir)?;
     let path = dir.join(format!("{}.json", safe_file_id(&receipt.receipt_id)));
     std::fs::write(&path, serde_json::to_vec_pretty(&evidence)?)?;
+    Ok(path)
+}
+
+fn write_quarantine_marker(pending: &PendingEdit, reason: &str) -> anyhow::Result<PathBuf> {
+    let dir = state_root(&pending.cwd).join("quarantine");
+    std::fs::create_dir_all(&dir)?;
+    let path = dir.join(format!("{}.json", safe_file_id(&pending.transaction_id)));
+    let record = json!({
+        "transaction_id": pending.transaction_id,
+        "contract_id": pending.contract_id,
+        "tool_use_id": pending.tool_use_id,
+        "reason": reason,
+        "ts_unix": current_unix_timestamp()
+    });
+    std::fs::write(&path, serde_json::to_vec_pretty(&record)?)?;
     Ok(path)
 }
 
@@ -1134,13 +1224,35 @@ PATCH"#;
 
         assert!(PathBuf::from(&pending.transaction_record_path).exists());
         assert_eq!(count_files(state_root(root).join("locks"), "lock"), 1);
-        let receipt_path = write_execution_receipt(&pending, true, true, 1, Vec::new());
+        let receipt_path = write_execution_receipt(
+            &pending,
+            super::ReceiptOutcome {
+                status: safeguard_protocol::ReceiptStatus::Accepted,
+                tool_success: true,
+                expected_result_verified: true,
+                rollback_completed: None,
+                completion_error: None,
+            },
+            1,
+            Vec::new(),
+        );
         assert!(receipt_path.as_ref().is_ok_and(|path| path.exists()));
         let first_hash = receipt_path
             .as_ref()
             .ok()
             .and_then(|path| receipt_field(path, "receipt_hash"));
-        let second_receipt_path = write_execution_receipt(&pending, true, true, 1, Vec::new());
+        let second_receipt_path = write_execution_receipt(
+            &pending,
+            super::ReceiptOutcome {
+                status: safeguard_protocol::ReceiptStatus::Accepted,
+                tool_success: true,
+                expected_result_verified: true,
+                rollback_completed: None,
+                completion_error: None,
+            },
+            1,
+            Vec::new(),
+        );
         let previous_hash = second_receipt_path
             .as_ref()
             .ok()
@@ -1160,6 +1272,76 @@ PATCH"#;
         };
         assert!(safeguard_transaction::complete_transaction(state_root(root), &id).is_ok());
         assert_eq!(count_files(state_root(root).join("locks"), "lock"), 0);
+    }
+
+    #[test]
+    fn post_tool_failure_rolls_back_transaction() {
+        let fixture = Fixture::new("post_tool_failure_rolls_back_transaction");
+        let file = fixture.root.join("a.txt");
+        assert!(std::fs::write(&file, "alpha").is_ok());
+        let Some(root) = fixture.root.to_str() else {
+            assert_eq!(fixture.root.display().to_string(), "");
+            return;
+        };
+        let command = r#"apply_patch <<'PATCH'
+*** Begin Patch
+*** Update File: a.txt
+@@
+-alpha
++beta
+*** End Patch
+PATCH"#;
+        let files = match plan_patch_files(root, command) {
+            Ok(files) => files,
+            Err(err) => {
+                assert_eq!(err.to_string(), "");
+                return;
+            }
+        };
+        let pending = match prepare_guarded_pending(
+            root,
+            "unit-failed-post",
+            "Bash",
+            "bash_apply_patch",
+            files,
+        ) {
+            Ok(pending) => pending,
+            Err(err) => {
+                assert_eq!(err.to_string(), "");
+                return;
+            }
+        };
+        assert!(write_pending(&pending).is_ok());
+        assert!(std::fs::write(&file, "beta").is_ok());
+
+        let request = super::HookRequest {
+            cwd: root.to_string(),
+            hook_event_name: "PostToolUse".to_string(),
+            tool_name: Some("Bash".to_string()),
+            tool_input: serde_json::json!({ "command": command }),
+            tool_response: serde_json::json!({ "isError": true }),
+            tool_use_id: Some("unit-failed-post".to_string()),
+        };
+        let output = super::post_tool_use(&request);
+
+        assert_eq!(
+            output.get("continue").and_then(serde_json::Value::as_bool),
+            Some(true)
+        );
+        assert!(std::fs::read_to_string(&file).is_ok_and(|value| value == "alpha"));
+        assert_eq!(count_files(state_root(root).join("locks"), "lock"), 0);
+        assert_eq!(
+            count_files(state_root(root).join("transactions"), "json"),
+            0
+        );
+        let receipt = first_receipt(root);
+        assert_eq!(
+            receipt
+                .as_ref()
+                .and_then(|value| value.get("status"))
+                .and_then(serde_json::Value::as_str),
+            Some("rolled_back")
+        );
     }
 
     #[test]
@@ -1324,6 +1506,16 @@ PATCH"#;
             .get(field)
             .and_then(serde_json::Value::as_str)
             .map(ToString::to_string)
+    }
+
+    fn first_receipt(root: &str) -> Option<serde_json::Value> {
+        let path = std::fs::read_dir(state_root(root).join("receipts"))
+            .ok()?
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .find(|path| path.extension().and_then(|value| value.to_str()) == Some("json"))?;
+        let bytes = std::fs::read(path).ok()?;
+        serde_json::from_slice(&bytes).ok()
     }
 
     struct Fixture {

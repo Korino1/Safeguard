@@ -111,6 +111,64 @@ impl Drop for TransactionGuard {
     }
 }
 
+#[derive(Debug)]
+struct AcquisitionGuard {
+    rollback_dir: PathBuf,
+    targets: Vec<LockedTarget>,
+    lock_paths: Vec<PathBuf>,
+    snapshot_paths: Vec<PathBuf>,
+    committed: bool,
+}
+
+impl AcquisitionGuard {
+    fn new(rollback_dir: PathBuf) -> Self {
+        Self {
+            rollback_dir,
+            targets: Vec::new(),
+            lock_paths: Vec::new(),
+            snapshot_paths: Vec::new(),
+            committed: false,
+        }
+    }
+
+    fn push_lock(&mut self, path: PathBuf) {
+        self.lock_paths.push(path);
+    }
+
+    fn push_snapshot(&mut self, path: PathBuf) {
+        self.snapshot_paths.push(path);
+    }
+
+    fn push_target(&mut self, target: LockedTarget) {
+        self.targets.push(target);
+    }
+
+    fn commit(mut self, id: TransactionId, state_root: PathBuf) -> TransactionGuard {
+        self.committed = true;
+        TransactionGuard {
+            id,
+            state_root,
+            targets: std::mem::take(&mut self.targets),
+            lock_paths: std::mem::take(&mut self.lock_paths),
+        }
+    }
+}
+
+impl Drop for AcquisitionGuard {
+    fn drop(&mut self) {
+        if self.committed {
+            return;
+        }
+        for path in &self.lock_paths {
+            let _ = std::fs::remove_file(path);
+        }
+        for path in &self.snapshot_paths {
+            let _ = std::fs::remove_file(path);
+        }
+        let _ = std::fs::remove_dir(&self.rollback_dir);
+    }
+}
+
 /// Persisted transaction metadata used to finish or recover guarded edits.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TransactionRecord {
@@ -257,8 +315,7 @@ pub fn begin_transaction(
         source,
     })?;
 
-    let mut accepted_targets = Vec::with_capacity(targets.len());
-    let mut lock_paths = Vec::with_capacity(targets.len());
+    let mut acquisition = AcquisitionGuard::new(rollback_dir.clone());
 
     for target in targets {
         let resolved = resolve_target(&workspace_root, &target.path)?;
@@ -266,7 +323,7 @@ pub fn begin_transaction(
         let lock_key = lock_key_for_path(&resolved);
         let lock_path = locks_dir.join(format!("{lock_key}.lock"));
         create_lock(&lock_path, &id, &resolved)?;
-        lock_paths.push(lock_path.clone());
+        acquisition.push_lock(lock_path.clone());
 
         let existed_before = resolved.exists();
         let before_blake3 = if existed_before {
@@ -292,12 +349,13 @@ pub fn begin_transaction(
                 path: rollback_path.clone(),
                 source,
             })?;
+            acquisition.push_snapshot(rollback_path.clone());
             Some(rollback_path)
         } else {
             None
         };
 
-        accepted_targets.push(LockedTarget {
+        acquisition.push_target(LockedTarget {
             path: resolved,
             lock_key,
             existed_before,
@@ -306,12 +364,7 @@ pub fn begin_transaction(
         });
     }
 
-    Ok(TransactionGuard {
-        id,
-        state_root,
-        targets: accepted_targets,
-        lock_paths,
-    })
+    Ok(acquisition.commit(id, state_root))
 }
 
 /// Build a transaction id from a shared execution contract.
@@ -399,6 +452,15 @@ pub fn complete_transaction(
                     source,
                 })?;
             }
+            if let Some(rollback_path) = target.rollback_path
+                && rollback_path.exists()
+            {
+                std::fs::remove_file(&rollback_path).map_err(|source| TransactionError::Io {
+                    operation: "remove rollback snapshot",
+                    path: rollback_path,
+                    source,
+                })?;
+            }
         }
     }
 
@@ -407,6 +469,14 @@ pub fn complete_transaction(
         std::fs::remove_file(&record_path).map_err(|source| TransactionError::Io {
             operation: "remove transaction record",
             path: record_path,
+            source,
+        })?;
+    }
+    let rollback_dir = state_root.join("rollback").join(id.as_str());
+    if rollback_dir.exists() {
+        std::fs::remove_dir_all(&rollback_dir).map_err(|source| TransactionError::Io {
+            operation: "remove rollback directory",
+            path: rollback_dir,
             source,
         })?;
     }
@@ -708,6 +778,7 @@ mod tests {
                 .join(format!("{}.json", id.as_str()))
                 .exists()
         );
+        assert!(!fixture.state.join("rollback").join(id.as_str()).exists());
     }
 
     #[test]
@@ -750,6 +821,7 @@ mod tests {
                 .join(format!("{}.json", id.as_str()))
                 .exists()
         );
+        assert!(!fixture.state.join("rollback").join(id.as_str()).exists());
     }
 
     #[test]
@@ -776,6 +848,34 @@ mod tests {
         );
 
         assert!(matches!(err, Err(TransactionError::StaleDigest { .. })));
+    }
+
+    #[test]
+    fn stale_digest_cleans_acquired_lock() {
+        let fixture = Fixture::new("stale_digest_cleans_acquired_lock");
+        let file = fixture.workspace.join("a.txt");
+        assert!(std::fs::write(&file, "changed").is_ok());
+        let id = valid_id("tx-stale-cleanup");
+
+        let err = begin_transaction(
+            &fixture.workspace,
+            &fixture.state,
+            id,
+            &[TransactionTarget {
+                path: PathBuf::from("a.txt"),
+                expected_blake3: Some(blake3_hex(b"old").as_hex().to_string()),
+            }],
+        );
+
+        assert!(matches!(err, Err(TransactionError::StaleDigest { .. })));
+        assert_eq!(count_files(fixture.state.join("locks"), "lock"), 0);
+        assert_eq!(
+            count_files(
+                fixture.state.join("rollback").join("tx-stale-cleanup"),
+                "rollback"
+            ),
+            0
+        );
     }
 
     #[test]
@@ -919,6 +1019,18 @@ mod tests {
                 }
             }
         }
+    }
+
+    fn count_files(dir: PathBuf, extension: &str) -> usize {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return 0;
+        };
+        entries
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry.path().extension().and_then(|value| value.to_str()) == Some(extension)
+            })
+            .count()
     }
 
     struct Fixture {
