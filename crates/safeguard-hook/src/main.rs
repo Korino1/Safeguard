@@ -1152,6 +1152,7 @@ fn plan_patch_files(cwd: &str, command: &str) -> anyhow::Result<Vec<PendingFile>
             continue;
         }
         let resolved = resolve_patch_path(&cwd, &path)?;
+        reject_internal_state_target(&cwd, &resolved)?;
         let existed_before = resolved.exists();
         let before_blake3 = if existed_before {
             Some(
@@ -1353,6 +1354,24 @@ fn resolve_patch_path(cwd: &Path, patch_path: &str) -> anyhow::Result<PathBuf> {
         anyhow::bail!("patch target escapes workspace: {patch_path}");
     }
     Ok(candidate)
+}
+
+fn reject_internal_state_target(cwd: &Path, target: &Path) -> anyhow::Result<()> {
+    let state_root = cwd.join(".safeguard");
+    let state_root = if state_root.exists() {
+        state_root.canonicalize()?
+    } else {
+        state_root
+    };
+    let target = if target.exists() {
+        target.canonicalize()?
+    } else {
+        target.to_path_buf()
+    };
+    if target.starts_with(&state_root) {
+        anyhow::bail!("patch target is inside Safeguard internal state");
+    }
+    Ok(())
 }
 
 fn is_risky_shell_write(command: &str) -> bool {
@@ -1806,6 +1825,28 @@ PATCH"#;
                 .and_then(|file| file.expected_after_blake3),
             Some(expected)
         );
+    }
+
+    #[test]
+    fn rejects_patch_target_inside_internal_state() {
+        let fixture = Fixture::new("rejects_patch_target_inside_internal_state");
+        let internal_dir = fixture.root.join(".safeguard");
+        assert!(std::fs::create_dir_all(&internal_dir).is_ok());
+        assert!(std::fs::write(internal_dir.join("audit.jsonl"), "alpha").is_ok());
+        let Some(root) = fixture.root.to_str() else {
+            assert_eq!(fixture.root.display().to_string(), "");
+            return;
+        };
+        let command = r#"apply_patch <<'PATCH'
+*** Begin Patch
+*** Update File: .safeguard/audit.jsonl
+@@
+-alpha
++beta
+*** End Patch
+PATCH"#;
+        let planned = plan_patch_files(root, command);
+        assert!(planned.is_err());
     }
 
     #[test]

@@ -189,6 +189,7 @@ Implemented now:
 - required validation command execution for explicit contracts; validation failure prevents acceptance and triggers rollback;
 - append-only receipt files with monotonic sequence ids;
 - serialized receipt chain-head updates through a local chain lock, with continuity through `previous_receipt_hash`;
+- hard denial of native patch targets inside `.safeguard/**`;
 - local MemoryX-shaped evidence summary export from contract and receipt hashes;
 - explicit recovery CLI for listing interrupted transactions and rolling them back with recovery receipts.
 
