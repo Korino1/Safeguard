@@ -831,11 +831,7 @@ fn enforce_capability_constraints(
                         anyhow::bail!("explicit contract max_files_changed exceeded");
                     }
                 }
-                "network" => {
-                    if value.as_bool().is_none() {
-                        anyhow::bail!("invalid network constraint");
-                    }
-                }
+                "network" => anyhow::bail!("unsupported executable constraint network"),
                 "allowed_write_roots" => {
                     if !value
                         .as_array()
@@ -845,9 +841,7 @@ fn enforce_capability_constraints(
                     }
                 }
                 "validation_timeout_seconds" => {
-                    if value.as_u64().is_none() {
-                        anyhow::bail!("invalid validation_timeout_seconds constraint");
-                    }
+                    anyhow::bail!("unsupported executable constraint validation_timeout_seconds");
                 }
                 _ => anyhow::bail!("unknown mandatory contract constraint"),
             }

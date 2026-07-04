@@ -170,6 +170,7 @@ impl VerifiedContract {
         validate_contract_issuer(&contract)?;
         validate_contract_workspace(&contract, workspace_root.as_ref())?;
         validate_capability_constraints(&contract)?;
+        validate_contract_invariants(&contract)?;
         Ok(Self { contract })
     }
 
@@ -218,6 +219,10 @@ pub enum ContractValidationError {
         /// Validation failure reason.
         reason: String,
     },
+    /// Constraint is known but not enforceable by this implementation.
+    UnsupportedExecutableConstraint(String),
+    /// Invariant is known only as a declaration and has no evaluator.
+    UnsupportedInvariant(String),
 }
 
 impl fmt::Display for ContractValidationError {
@@ -246,6 +251,12 @@ impl fmt::Display for ContractValidationError {
             Self::UnknownConstraint(key) => write!(f, "unknown mandatory constraint {key}"),
             Self::InvalidConstraint { key, reason } => {
                 write!(f, "invalid constraint {key}: {reason}")
+            }
+            Self::UnsupportedExecutableConstraint(key) => {
+                write!(f, "unsupported executable constraint {key}")
+            }
+            Self::UnsupportedInvariant(name) => {
+                write!(f, "unsupported contract invariant {name}")
             }
         }
     }
@@ -337,7 +348,7 @@ fn validate_constraint(
     value: &serde_json::Value,
 ) -> Result<(), ContractValidationError> {
     match key {
-        "max_files_changed" | "validation_timeout_seconds" => {
+        "max_files_changed" => {
             if value.as_u64().is_some() {
                 Ok(())
             } else {
@@ -347,16 +358,9 @@ fn validate_constraint(
                 })
             }
         }
-        "network" => {
-            if value.as_bool().is_some() {
-                Ok(())
-            } else {
-                Err(ContractValidationError::InvalidConstraint {
-                    key: key.to_string(),
-                    reason: "expected boolean".to_string(),
-                })
-            }
-        }
+        "network" | "validation_timeout_seconds" => Err(
+            ContractValidationError::UnsupportedExecutableConstraint(key.to_string()),
+        ),
         "allowed_write_roots" => {
             if value
                 .as_array()
@@ -371,6 +375,16 @@ fn validate_constraint(
             }
         }
         _ => Err(ContractValidationError::UnknownConstraint(key.to_string())),
+    }
+}
+
+fn validate_contract_invariants(
+    contract: &ExecutionContract,
+) -> Result<(), ContractValidationError> {
+    if let Some(name) = contract.invariants.first() {
+        Err(ContractValidationError::UnsupportedInvariant(name.clone()))
+    } else {
+        Ok(())
     }
 }
 
@@ -654,6 +668,7 @@ mod tests {
     use std::collections::BTreeMap;
 
     use super::Capability;
+    use super::ContractValidationError;
     use super::ExecutionContract;
     use super::FileOperation;
     use super::ReceiptExecutor;
@@ -714,17 +729,12 @@ mod tests {
     }
 
     #[test]
-    fn verified_contract_accepts_known_constraints() {
+    fn verified_contract_accepts_enforced_constraints() {
         let mut contract = ExecutionContract::v0_1("known-constraints");
         contract.expires_at = Some("2099-01-01T00:00:00Z".to_string());
         let mut constraints = BTreeMap::new();
         constraints.insert("max_files_changed".to_string(), serde_json::json!(1));
-        constraints.insert("network".to_string(), serde_json::json!(false));
         constraints.insert("allowed_write_roots".to_string(), serde_json::json!(["."]));
-        constraints.insert(
-            "validation_timeout_seconds".to_string(),
-            serde_json::json!(120),
-        );
         contract.capabilities.push(Capability {
             tool: "apply_patch".to_string(),
             operation: "modify".to_string(),
@@ -733,6 +743,62 @@ mod tests {
         });
         let verified = VerifiedContract::verify(contract, ".");
         assert!(verified.is_ok());
+    }
+
+    #[test]
+    fn verified_contract_rejects_declarative_network_constraint() {
+        let mut contract = ExecutionContract::v0_1("network-constraint");
+        let mut constraints = BTreeMap::new();
+        constraints.insert("network".to_string(), serde_json::json!(false));
+        contract.capabilities.push(Capability {
+            tool: "Bash".to_string(),
+            operation: "execute".to_string(),
+            resources: vec!["*".to_string()],
+            constraints,
+        });
+        let verified = VerifiedContract::verify(contract, ".");
+        assert_eq!(
+            verified,
+            Err(ContractValidationError::UnsupportedExecutableConstraint(
+                "network".to_string()
+            ))
+        );
+    }
+
+    #[test]
+    fn verified_contract_rejects_declarative_validation_timeout_constraint() {
+        let mut contract = ExecutionContract::v0_1("validation-timeout");
+        let mut constraints = BTreeMap::new();
+        constraints.insert(
+            "validation_timeout_seconds".to_string(),
+            serde_json::json!(30),
+        );
+        contract.capabilities.push(Capability {
+            tool: "apply_patch".to_string(),
+            operation: "modify".to_string(),
+            resources: vec!["README.md".to_string()],
+            constraints,
+        });
+        let verified = VerifiedContract::verify(contract, ".");
+        assert_eq!(
+            verified,
+            Err(ContractValidationError::UnsupportedExecutableConstraint(
+                "validation_timeout_seconds".to_string()
+            ))
+        );
+    }
+
+    #[test]
+    fn verified_contract_rejects_unsupported_invariants() {
+        let mut contract = ExecutionContract::v0_1("unsupported-invariant");
+        contract.invariants.push("no_new_unsafe".to_string());
+        let verified = VerifiedContract::verify(contract, ".");
+        assert_eq!(
+            verified,
+            Err(ContractValidationError::UnsupportedInvariant(
+                "no_new_unsafe".to_string()
+            ))
+        );
     }
 
     #[test]

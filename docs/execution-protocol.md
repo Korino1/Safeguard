@@ -28,9 +28,11 @@ Separate-project responsibilities:
 - Safeguard: execute or supervise execution, enforce contract, verify result, emit `ExecutionReceipt`.
 - MemoryX: store the contract basis, evidence, receipts, and learned state.
 
-## ExecutionContract v0.1
+## Patch/Edit ExecutionContract v0.1
 
-An `ExecutionContract` is the authority Safeguard uses to decide what an agent may do.
+An `ExecutionContract` is the authority Safeguard uses to decide what a guarded
+patch/edit transaction may do. In the current implementation this is not a full
+process, Bash, network, or validation sandbox.
 
 ```yaml
 execution_contract:
@@ -58,12 +60,6 @@ execution_contract:
         max_files_changed: 1
         allowed_write_roots:
           - "crates/example/src/**"
-    - tool: "Bash"
-      operation: "execute"
-      resources:
-        - "cargo test -p example"
-      constraints:
-        network: false
   denied_resources:
     - ".git/**"
     - ".safeguard/**"
@@ -77,9 +73,7 @@ execution_contract:
   required_validations:
     - command: "cargo fmt --check"
     - command: "cargo test -p example"
-  invariants:
-    - "no_unclaimed_file_changes"
-    - "no_digest_mismatch"
+  invariants: []
 ```
 
 ### Contract Semantics
@@ -87,14 +81,16 @@ execution_contract:
 - `contract_id` is the stable correlation key across Safeguard, Cabal, and MemoryX.
 - `capabilities` define allowed operations. Anything not allowed is denied by default.
 - Contracts are validated before authorization as `ParsedContract -> VerifiedContract -> ActiveContract`.
-- Schema v0.1 validators currently require a supported `schema_version`, non-expired `expires_at`, trusted local issuer policy, matching workspace root, allowed roots inside the workspace, and known capability constraints.
-- Unknown mandatory capability constraints are denied by default. Current known constraint keys are `max_files_changed`, `network`, `allowed_write_roots`, and `validation_timeout_seconds`.
+- Schema v0.1 validators currently require a supported `schema_version`, non-expired `expires_at`, trusted local issuer policy, matching workspace root, allowed roots inside the workspace, known enforceable capability constraints, and no unsupported contract invariants.
+- Unknown mandatory capability constraints are denied by default.
+- Current enforced constraint keys are `max_files_changed` and `allowed_write_roots`.
+- `network` and `validation_timeout_seconds` are intentionally rejected as unsupported executable constraints until Safeguard can enforce network isolation, timeout, and process-tree termination.
 - In schema v0.1, `capabilities[].operation` is accepted as either a tool action such as `invoke` or a resource operation such as `add`, `modify`, or `delete`. Safeguard treats `tool: apply_patch` as the patch invocation authority even when Codex delivered it through a shell-wrapped `apply_patch` hook event.
 - `denied_resources` override allowed capabilities.
 - `expected_changes` bind the intended result to files, operations, and optional digests.
 - `expected_changes.files[].requirement` defaults to `required`. Required expected changes must be observed before acceptance. Optional expected changes are allowed but not mandatory.
-- `required_validations` define checks that must be attached to the receipt before acceptance.
-- `invariants` define acceptance conditions.
+- `required_validations` define checks that must be attached to the receipt before acceptance. Current execution is blocking and not sandboxed.
+- `invariants` are reserved for future evaluator-backed checks. Non-empty contract invariants are rejected in v0.1 until an evaluator registry exists.
 
 ## ExecutionReceipt v0.1
 
@@ -110,7 +106,7 @@ execution_receipt:
   completed_at: "2026-07-03T00:11:00Z"
   executor:
     system: "safeguard"
-    version: "1.2.0"
+    version: "1.3.0"
   observed_operations:
     - tool: "apply_patch"
       operation: "modify"
@@ -183,7 +179,7 @@ memoryx_evidence:
 - Breaking schema changes must bump major version.
 - Unknown fields should be ignored by readers unless policy explicitly requires strict mode.
 - Safeguard must preserve enough raw local evidence to regenerate receipt hashes.
-- Cabal must not assume a receipt is accepted unless `status: accepted` and required invariants passed.
+- Cabal must not assume a receipt is accepted unless `status: accepted` and all required receipt checks passed. Contract-level invariants require explicit evaluator support before use.
 - MemoryX stores evidence summaries and hashes; it does not become the execution authority.
 
 ## Current Implementation Mapping
@@ -197,6 +193,7 @@ Implemented now:
 - hook-side implicit `ExecutionContract` binding for native `apply_patch`;
 - optional explicit `ExecutionContract` loading through `SAFEGUARD_CONTRACT_PATH`;
 - hook-side capability, expected-file, and denied-resource enforcement for explicit contracts;
+- explicit contracts mediate native apply-patch and guarded edit paths, not arbitrary process/network execution;
 - persistent transaction lifecycle across separate `PreToolUse` and `PostToolUse` hook processes;
 - hook-side `ExecutionReceipt v0.1` emission for guarded native edits;
 - receipt-level expected add/modify/delete result verification;
@@ -211,4 +208,8 @@ Implemented now:
 
 Next Safeguard implementation steps:
 
-- run release packaging and plugin reinstall validation before the next public release.
+- authenticate contract authority with signed or trusted-IPC delivery;
+- reject or mediate ordinary Bash/process/network side effects under a future full execution contract;
+- add a crash-safe state machine for commit decision, final receipt recovery, and symmetric rollback finality;
+- move trusted state out of the editable workspace;
+- share one receipt/evidence writer between hook and MCP.
