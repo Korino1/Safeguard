@@ -187,7 +187,8 @@ Implemented now:
 - exact expected after-content digest verification for standard `apply_patch` edits;
 - patch section digest recorded as `diff_digest` / `expected_diff_digest` evidence for native patch edits;
 - required validation command execution for explicit contracts; validation failure prevents acceptance and triggers rollback;
-- local receipt hash-chain continuity through `previous_receipt_hash`;
+- append-only receipt files with monotonic sequence ids;
+- serialized receipt chain-head updates through a local chain lock, with continuity through `previous_receipt_hash`;
 - local MemoryX-shaped evidence summary export from contract and receipt hashes;
 - explicit recovery CLI for listing interrupted transactions and rolling them back with recovery receipts.
 

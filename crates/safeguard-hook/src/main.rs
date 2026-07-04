@@ -5,6 +5,7 @@ use std::io::Read;
 use std::io::Write;
 use std::path::Path;
 use std::path::PathBuf;
+use std::time::Duration;
 use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
 
@@ -84,6 +85,24 @@ struct ReceiptOutcome {
     validations_passed: bool,
     rollback_completed: Option<bool>,
     completion_error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ReceiptChainHead {
+    sequence: u64,
+    receipt_hash: String,
+    receipt_path: String,
+}
+
+#[derive(Debug)]
+struct ReceiptChainLock {
+    path: PathBuf,
+}
+
+impl Drop for ReceiptChainLock {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
 }
 
 fn handle_hook(request: &HookRequest) -> Value {
@@ -848,17 +867,11 @@ fn write_execution_receipt(
         policy_violations,
         invariants,
         receipt_hash: None,
-        previous_receipt_hash: latest_receipt_hash(&pending.cwd),
+        previous_receipt_hash: None,
         signature: None,
         extensions: Default::default(),
     };
-    let unsigned = serde_json::to_vec(&receipt)?;
-    receipt.receipt_hash = Some(safeguard_core::blake3_hex(&unsigned).as_hex().to_string());
-
-    let dir = state_root(&pending.cwd).join("receipts");
-    std::fs::create_dir_all(&dir)?;
-    let path = dir.join(format!("{}.json", safe_file_id(&receipt.receipt_id)));
-    std::fs::write(&path, serde_json::to_vec_pretty(&receipt)?)?;
+    let path = commit_receipt(&pending.cwd, &mut receipt)?;
     let _ = write_memoryx_evidence(pending, &receipt, &path);
     Ok(path)
 }
@@ -993,18 +1006,85 @@ fn write_recovery_receipt(
             status: safeguard_protocol::InvariantStatus::Passed,
         }],
         receipt_hash: None,
-        previous_receipt_hash: latest_receipt_hash(cwd),
+        previous_receipt_hash: None,
         signature: None,
         extensions: Default::default(),
     };
-    let unsigned = serde_json::to_vec(&receipt)?;
-    receipt.receipt_hash = Some(safeguard_core::blake3_hex(&unsigned).as_hex().to_string());
+    commit_receipt(cwd, &mut receipt)
+}
 
-    let dir = state_root(cwd).join("receipts");
-    std::fs::create_dir_all(&dir)?;
-    let path = dir.join(format!("{}.json", safe_file_id(&receipt.receipt_id)));
-    std::fs::write(&path, serde_json::to_vec_pretty(&receipt)?)?;
+fn commit_receipt(
+    cwd: &str,
+    receipt: &mut safeguard_protocol::ExecutionReceipt,
+) -> anyhow::Result<PathBuf> {
+    let state_root = state_root(cwd);
+    let receipts_dir = state_root.join("receipts");
+    std::fs::create_dir_all(&receipts_dir)?;
+    let _lock = acquire_receipt_chain_lock(&state_root)?;
+    let previous = load_receipt_chain_head(&state_root);
+    let sequence = previous.as_ref().map(|head| head.sequence + 1).unwrap_or(1);
+    let base_receipt_id = receipt.receipt_id.clone();
+    receipt.receipt_id = format!("{sequence:020}-{}", safe_file_id(&base_receipt_id));
+    receipt.previous_receipt_hash = previous.map(|head| head.receipt_hash);
+    receipt.receipt_hash = None;
+    let unsigned = serde_json::to_vec(&receipt)?;
+    let receipt_hash = safeguard_core::blake3_hex(&unsigned).as_hex().to_string();
+    receipt.receipt_hash = Some(receipt_hash.clone());
+
+    let path = receipts_dir.join(format!("{}.json", safe_file_id(&receipt.receipt_id)));
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)?;
+    file.write_all(&serde_json::to_vec_pretty(&receipt)?)?;
+    write_receipt_chain_head(
+        &state_root,
+        &ReceiptChainHead {
+            sequence,
+            receipt_hash,
+            receipt_path: path.display().to_string(),
+        },
+    )?;
     Ok(path)
+}
+
+fn acquire_receipt_chain_lock(state_root: &Path) -> anyhow::Result<ReceiptChainLock> {
+    let dir = state_root.join("receipt-chain");
+    std::fs::create_dir_all(&dir)?;
+    let path = dir.join("head.lock");
+    for _ in 0..50 {
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
+            Ok(mut file) => {
+                writeln!(file, "pid={}", std::process::id())?;
+                return Ok(ReceiptChainLock { path });
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            Err(err) => return Err(err.into()),
+        }
+    }
+    anyhow::bail!("receipt chain lock is held")
+}
+
+fn load_receipt_chain_head(state_root: &Path) -> Option<ReceiptChainHead> {
+    let path = state_root.join("receipt-chain").join("head.json");
+    let bytes = std::fs::read(path).ok()?;
+    serde_json::from_slice(&bytes).ok()
+}
+
+fn write_receipt_chain_head(state_root: &Path, head: &ReceiptChainHead) -> anyhow::Result<()> {
+    let dir = state_root.join("receipt-chain");
+    std::fs::create_dir_all(&dir)?;
+    let path = dir.join("head.json");
+    let temp_path = dir.join("head.tmp");
+    std::fs::write(&temp_path, serde_json::to_vec_pretty(head)?)?;
+    std::fs::rename(temp_path, path)?;
+    Ok(())
 }
 
 fn digest_path_if_exists(path: &Path) -> Option<String> {
@@ -1014,25 +1094,6 @@ fn digest_path_if_exists(path: &Path) -> Option<String> {
     std::fs::read(path)
         .ok()
         .map(|bytes| safeguard_core::blake3_hex(&bytes).as_hex().to_string())
-}
-
-fn latest_receipt_hash(cwd: &str) -> Option<String> {
-    let dir = state_root(cwd).join("receipts");
-    let entries = std::fs::read_dir(dir).ok()?;
-    let mut paths = entries
-        .filter_map(Result::ok)
-        .map(|entry| entry.path())
-        .filter(|path| path.extension().and_then(|value| value.to_str()) == Some("json"))
-        .collect::<Vec<_>>();
-    paths.sort();
-    paths.into_iter().rev().find_map(|path| {
-        let bytes = std::fs::read(path).ok()?;
-        let value: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
-        value
-            .get("receipt_hash")
-            .and_then(serde_json::Value::as_str)
-            .map(ToString::to_string)
-    })
 }
 
 fn current_unix_timestamp() -> u64 {
@@ -1512,7 +1573,9 @@ PATCH"#;
             .and_then(|path| receipt_field(path, "previous_receipt_hash"));
         assert!(first_hash.is_some());
         assert_eq!(previous_hash, first_hash);
-        assert_eq!(count_files(state_root(root).join("evidence"), "json"), 1);
+        assert_ne!(receipt_path.ok(), second_receipt_path.ok());
+        assert_eq!(count_files(state_root(root).join("receipts"), "json"), 2);
+        assert_eq!(count_files(state_root(root).join("evidence"), "json"), 2);
         assert!(write_pending(&pending).is_ok());
         assert!(read_pending(root, "unit-1").is_ok_and(|pending| pending.is_some()));
 
