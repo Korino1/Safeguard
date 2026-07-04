@@ -84,6 +84,7 @@ execution_contract:
 
 - `contract_id` is the stable correlation key across Safeguard, Cabal, and MemoryX.
 - `capabilities` define allowed operations. Anything not allowed is denied by default.
+- In schema v0.1, `capabilities[].operation` is accepted as either a tool action such as `invoke` or a resource operation such as `add`, `modify`, or `delete`. Safeguard treats `tool: apply_patch` as the patch invocation authority even when Codex delivered it through a shell-wrapped `apply_patch` hook event.
 - `denied_resources` override allowed capabilities.
 - `expected_changes` bind the intended result to files, operations, and optional digests.
 - `required_validations` define checks that must be attached to the receipt before acceptance.

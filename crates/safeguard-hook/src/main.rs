@@ -602,13 +602,38 @@ fn capability_matches(
     file: &PendingFile,
 ) -> bool {
     contract.capabilities.iter().any(|capability| {
-        (capability.tool == "*" || capability.tool == tool_name)
-            && (capability.operation == "*" || capability.operation == command_kind)
+        capability_tool_matches(&capability.tool, tool_name, command_kind)
+            && capability_operation_matches(&capability.operation, command_kind, file)
             && capability
                 .resources
                 .iter()
                 .any(|resource| resource_matches(cwd, resource, &file.path))
     })
+}
+
+fn capability_tool_matches(capability_tool: &str, tool_name: &str, command_kind: &str) -> bool {
+    capability_tool == "*"
+        || capability_tool == tool_name
+        || (capability_tool == "apply_patch" && command_kind.contains("apply_patch"))
+}
+
+fn capability_operation_matches(
+    capability_operation: &str,
+    command_kind: &str,
+    file: &PendingFile,
+) -> bool {
+    capability_operation == "*"
+        || capability_operation == command_kind
+        || capability_operation == "invoke"
+        || capability_operation == file_resource_operation(file)
+}
+
+fn file_resource_operation(file: &PendingFile) -> &'static str {
+    match file.operation.as_str() {
+        "add" => "add",
+        "delete" => "delete",
+        _ => "modify",
+    }
 }
 
 fn resource_matches(cwd: &str, resource: &str, target: &str) -> bool {
@@ -1455,6 +1480,43 @@ PATCH"#;
         let enforced =
             enforce_explicit_contract(root, "Bash", "bash_apply_patch", &attempted, contract);
         assert!(enforced.is_err());
+    }
+
+    #[test]
+    fn docs_style_contract_allows_patch_modify_operation() {
+        let fixture = Fixture::new("docs_style_contract_allows_patch_modify_operation");
+        let file = fixture.root.join("a.txt");
+        assert!(std::fs::write(&file, "alpha").is_ok());
+        let Some(root) = fixture.root.to_str() else {
+            assert_eq!(fixture.root.display().to_string(), "");
+            return;
+        };
+        let files = vec![super::PendingFile {
+            path: file.display().to_string(),
+            operation: "update".to_string(),
+            existed_before: true,
+            before_blake3: None,
+        }];
+        let mut contract = safeguard_protocol::ExecutionContract::v0_1("docs-style");
+        contract.capabilities.push(safeguard_protocol::Capability {
+            tool: "apply_patch".to_string(),
+            operation: "modify".to_string(),
+            resources: vec![file.display().to_string()],
+            constraints: Default::default(),
+        });
+        contract
+            .expected_changes
+            .files
+            .push(safeguard_protocol::ExpectedFileChange {
+                path: file.display().to_string(),
+                operation: safeguard_protocol::FileOperation::Modify,
+                before_digest: None,
+                expected_diff_digest: None,
+            });
+
+        let enforced =
+            enforce_explicit_contract(root, "Bash", "bash_apply_patch", &files, contract);
+        assert!(enforced.is_ok());
     }
 
     #[test]
