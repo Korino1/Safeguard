@@ -81,7 +81,6 @@ struct PendingFile {
 #[derive(Debug, Clone)]
 struct ReceiptOutcome {
     status: safeguard_protocol::ReceiptStatus,
-    tool_success: bool,
     expected_result_verified: bool,
     validations_passed: bool,
     rollback_completed: Option<bool>,
@@ -206,13 +205,14 @@ fn pre_tool_use(request: &HookRequest) -> Value {
             .and_then(|command| plan_patch_files(&request.cwd, command).ok())
         {
             Some(files) => {
-                let tool_use_id = request
-                    .tool_use_id
-                    .clone()
-                    .unwrap_or_else(|| "unknown-tool-use".to_string());
+                let Some(tool_use_id) = request.tool_use_id.as_deref() else {
+                    return deny_pre_tool_use(
+                        "Safeguard could not identify this edit; retry the edit".to_string(),
+                    );
+                };
                 match prepare_and_write_guarded_pending(
                     &request.cwd,
-                    &tool_use_id,
+                    tool_use_id,
                     tool_name,
                     "apply_patch",
                     files,
@@ -235,13 +235,14 @@ fn pre_tool_use(request: &HookRequest) -> Value {
         if command.contains("apply_patch") {
             return match plan_patch_files(&request.cwd, command) {
                 Ok(files) => {
-                    let tool_use_id = request
-                        .tool_use_id
-                        .clone()
-                        .unwrap_or_else(|| stable_id_for_command(command));
+                    let Some(tool_use_id) = request.tool_use_id.as_deref() else {
+                        return deny_pre_tool_use(
+                            "Safeguard could not identify this edit; retry the edit".to_string(),
+                        );
+                    };
                     match prepare_and_write_guarded_pending(
                         &request.cwd,
-                        &tool_use_id,
+                        tool_use_id,
                         tool_name,
                         "bash_apply_patch",
                         files,
@@ -306,7 +307,21 @@ fn permission_request(request: &HookRequest) -> Value {
 
 fn post_tool_use(request: &HookRequest) -> Value {
     let Some(tool_use_id) = request.tool_use_id.as_deref() else {
-        return continue_output();
+        let _ = append_policy_audit(
+            &request.cwd,
+            json!({
+                "operation": "missing_tool_use_id",
+                "hook": "PostToolUse",
+                "reason": "guarded edit could not be correlated"
+            }),
+        );
+        return json!({
+            "continue": true,
+            "hookSpecificOutput": {
+                "hookEventName": "PostToolUse",
+                "message": "Safeguard could not identify this edit; retry the edit"
+            }
+        });
     };
     let Ok(Some(pending)) = read_pending(&request.cwd, tool_use_id) else {
         return continue_output();
@@ -366,11 +381,10 @@ fn post_tool_use(request: &HookRequest) -> Value {
 
     match safeguard_transaction::TransactionId::new(pending.transaction_id.clone()) {
         Ok(id) if accepted => {
-            match write_execution_receipt(
+            let prepared = write_execution_receipt(
                 &pending,
                 ReceiptOutcome {
-                    status: receipt_status.clone(),
-                    tool_success: success,
+                    status: safeguard_protocol::ReceiptStatus::Prepared,
                     expected_result_verified,
                     validations_passed,
                     rollback_completed,
@@ -379,13 +393,49 @@ fn post_tool_use(request: &HookRequest) -> Value {
                 started_at,
                 changed_files.clone(),
                 validations.clone(),
-            ) {
+            );
+            match prepared {
                 Ok(_) => {
-                    receipt_written = true;
                     match safeguard_transaction::complete_transaction(state_root(&pending.cwd), &id)
                     {
                         Ok(()) => {
                             transaction_cleaned = true;
+                            match write_execution_receipt(
+                                &pending,
+                                ReceiptOutcome {
+                                    status: receipt_status.clone(),
+                                    expected_result_verified,
+                                    validations_passed,
+                                    rollback_completed,
+                                    completion_error: completion_error.clone(),
+                                },
+                                started_at,
+                                changed_files.clone(),
+                                validations.clone(),
+                            ) {
+                                Ok(_) => {
+                                    receipt_written = true;
+                                }
+                                Err(err) => {
+                                    receipt_status = safeguard_protocol::ReceiptStatus::Partial;
+                                    completion_error = Some(format!("receipt write failed: {err}"));
+                                    let _ =
+                                        write_quarantine_marker(&pending, "receipt_write_failed");
+                                    let _ = write_execution_receipt(
+                                        &pending,
+                                        ReceiptOutcome {
+                                            status: receipt_status.clone(),
+                                            expected_result_verified,
+                                            validations_passed,
+                                            rollback_completed,
+                                            completion_error: completion_error.clone(),
+                                        },
+                                        started_at,
+                                        changed_files.clone(),
+                                        validations.clone(),
+                                    );
+                                }
+                            }
                         }
                         Err(err) => {
                             receipt_status = safeguard_protocol::ReceiptStatus::Partial;
@@ -395,7 +445,6 @@ fn post_tool_use(request: &HookRequest) -> Value {
                                 &pending,
                                 ReceiptOutcome {
                                     status: receipt_status.clone(),
-                                    tool_success: success,
                                     expected_result_verified,
                                     validations_passed,
                                     rollback_completed,
@@ -428,7 +477,6 @@ fn post_tool_use(request: &HookRequest) -> Value {
                     &pending,
                     ReceiptOutcome {
                         status: receipt_status.clone(),
-                        tool_success: success,
                         expected_result_verified,
                         validations_passed,
                         rollback_completed,
@@ -460,7 +508,6 @@ fn post_tool_use(request: &HookRequest) -> Value {
                                         &pending,
                                         ReceiptOutcome {
                                             status: receipt_status.clone(),
-                                            tool_success: success,
                                             expected_result_verified,
                                             validations_passed,
                                             rollback_completed,
@@ -490,7 +537,6 @@ fn post_tool_use(request: &HookRequest) -> Value {
                     &pending,
                     ReceiptOutcome {
                         status: receipt_status.clone(),
-                        tool_success: success,
                         expected_result_verified,
                         validations_passed,
                         rollback_completed,
@@ -514,7 +560,6 @@ fn post_tool_use(request: &HookRequest) -> Value {
                     &pending,
                     ReceiptOutcome {
                         status: receipt_status.clone(),
-                        tool_success: success,
                         expected_result_verified,
                         validations_passed,
                         rollback_completed,
@@ -538,7 +583,6 @@ fn post_tool_use(request: &HookRequest) -> Value {
                 &pending,
                 ReceiptOutcome {
                     status: receipt_status.clone(),
-                    tool_success: success,
                     expected_result_verified,
                     validations_passed,
                     rollback_completed,
@@ -705,6 +749,7 @@ fn implicit_contract(
             operation: protocol_file_operation(&file.operation),
             before_digest: file.before_blake3.clone(),
             expected_diff_digest: file.patch_blake3.clone(),
+            requirement: safeguard_protocol::ExpectedChangeRequirement::Required,
         })
         .collect();
     contract
@@ -740,6 +785,8 @@ fn enforce_explicit_contract(
     files: &[PendingFile],
     mut contract: safeguard_protocol::ExecutionContract,
 ) -> anyhow::Result<safeguard_protocol::ExecutionContract> {
+    contract = safeguard_protocol::VerifiedContract::verify(contract, cwd)?.into_inner();
+    enforce_capability_constraints(&contract, files)?;
     for file in files {
         if contract
             .denied_resources
@@ -755,6 +802,7 @@ fn enforce_explicit_contract(
             anyhow::bail!("explicit contract does not grant this patch capability");
         }
     }
+    enforce_required_expected_changes(cwd, &contract, files)?;
 
     for expected in &mut contract.expected_changes.files {
         if expected.before_digest.is_none()
@@ -766,6 +814,66 @@ fn enforce_explicit_contract(
         }
     }
     Ok(contract)
+}
+
+fn enforce_capability_constraints(
+    contract: &safeguard_protocol::ExecutionContract,
+    files: &[PendingFile],
+) -> anyhow::Result<()> {
+    for capability in &contract.capabilities {
+        for (key, value) in &capability.constraints {
+            match key.as_str() {
+                "max_files_changed" => {
+                    let Some(max) = value.as_u64() else {
+                        anyhow::bail!("invalid max_files_changed constraint");
+                    };
+                    if files.len() as u64 > max {
+                        anyhow::bail!("explicit contract max_files_changed exceeded");
+                    }
+                }
+                "network" => {
+                    if value.as_bool().is_none() {
+                        anyhow::bail!("invalid network constraint");
+                    }
+                }
+                "allowed_write_roots" => {
+                    if !value
+                        .as_array()
+                        .is_some_and(|items| items.iter().all(|item| item.as_str().is_some()))
+                    {
+                        anyhow::bail!("invalid allowed_write_roots constraint");
+                    }
+                }
+                "validation_timeout_seconds" => {
+                    if value.as_u64().is_none() {
+                        anyhow::bail!("invalid validation_timeout_seconds constraint");
+                    }
+                }
+                _ => anyhow::bail!("unknown mandatory contract constraint"),
+            }
+        }
+    }
+    Ok(())
+}
+
+fn enforce_required_expected_changes(
+    cwd: &str,
+    contract: &safeguard_protocol::ExecutionContract,
+    files: &[PendingFile],
+) -> anyhow::Result<()> {
+    for expected in contract.expected_changes.files.iter().filter(|expected| {
+        expected.requirement == safeguard_protocol::ExpectedChangeRequirement::Required
+    }) {
+        let observed = files.iter().any(|file| {
+            expected.operation == protocol_file_operation(&file.operation)
+                && resource_matches(cwd, &expected.path, &file.path)
+                && expected_diff_matches(expected, file)
+        });
+        if !observed {
+            anyhow::bail!("required expected change was not observed");
+        }
+    }
+    Ok(())
 }
 
 fn expected_change_matches(
@@ -804,7 +912,37 @@ fn capability_matches(
                 .resources
                 .iter()
                 .any(|resource| resource_matches(cwd, resource, &file.path))
+            && capability_constraints_match(cwd, capability, file)
     })
+}
+
+fn capability_constraints_match(
+    cwd: &str,
+    capability: &safeguard_protocol::Capability,
+    file: &PendingFile,
+) -> bool {
+    let Some(roots) = capability
+        .constraints
+        .get("allowed_write_roots")
+        .and_then(serde_json::Value::as_array)
+    else {
+        return true;
+    };
+    roots
+        .iter()
+        .filter_map(serde_json::Value::as_str)
+        .any(|root| {
+            if root.ends_with("/**") || root.ends_with("\\**") {
+                resource_matches(cwd, root, &file.path)
+            } else {
+                resolve_resource_path(cwd, root).is_some_and(|root| {
+                    PathBuf::from(&file.path)
+                        .canonicalize()
+                        .unwrap_or_else(|_| PathBuf::from(&file.path))
+                        .starts_with(root)
+                })
+            }
+        })
 }
 
 fn capability_tool_matches(capability_tool: &str, tool_name: &str, command_kind: &str) -> bool {
@@ -1035,10 +1173,15 @@ fn write_execution_receipt(
     validations: Vec<safeguard_protocol::ValidationResult>,
 ) -> anyhow::Result<PathBuf> {
     let receipt_id = format!("receipt-{}", safe_file_id(&pending.tool_use_id));
+    let transaction_completed = match &outcome.status {
+        safeguard_protocol::ReceiptStatus::Accepted => true,
+        safeguard_protocol::ReceiptStatus::RolledBack => outcome.rollback_completed != Some(false),
+        _ => false,
+    };
     let mut invariants = vec![
         safeguard_protocol::InvariantResult {
             name: "transaction_completed".to_string(),
-            status: if outcome.tool_success {
+            status: if transaction_completed {
                 safeguard_protocol::InvariantStatus::Passed
             } else {
                 safeguard_protocol::InvariantStatus::Failed
@@ -1110,7 +1253,9 @@ fn write_execution_receipt(
         extensions: Default::default(),
     };
     let path = commit_receipt(&pending.cwd, &mut receipt)?;
-    let _ = write_memoryx_evidence(pending, &receipt, &path);
+    if receipt.status != safeguard_protocol::ReceiptStatus::Prepared {
+        let _ = write_memoryx_evidence(pending, &receipt, &path);
+    }
     Ok(path)
 }
 
@@ -1786,10 +1931,6 @@ fn safe_file_id(value: &str) -> String {
         .collect()
 }
 
-fn stable_id_for_command(command: &str) -> String {
-    safeguard_core::blake3_hex(command.as_bytes()).as_hex()[..16].to_string()
-}
-
 fn preview(command: &str) -> String {
     const MAX: usize = 160;
     if command.chars().count() <= MAX {
@@ -1853,6 +1994,67 @@ PATCH"#,
     }
 
     #[test]
+    fn pre_tool_use_apply_patch_missing_tool_use_id_is_denied() {
+        let fixture = Fixture::new("pre_tool_use_apply_patch_missing_tool_use_id_is_denied");
+        let file = fixture.root.join("a.txt");
+        assert!(std::fs::write(&file, "alpha").is_ok());
+        let Some(root) = fixture.root.to_str() else {
+            assert_eq!(fixture.root.display().to_string(), "");
+            return;
+        };
+        let command = r#"apply_patch <<'PATCH'
+*** Begin Patch
+*** Update File: a.txt
+@@
+-alpha
++beta
+*** End Patch
+PATCH"#;
+        let request = super::HookRequest {
+            cwd: root.to_string(),
+            hook_event_name: "PreToolUse".to_string(),
+            tool_name: Some("apply_patch".to_string()),
+            tool_input: serde_json::json!({ "cmd": command }),
+            tool_response: serde_json::Value::Null,
+            tool_use_id: None,
+        };
+
+        let output = super::pre_tool_use(&request);
+
+        assert!(pre_tool_use_denied(&output));
+        assert!(read_pending(root, "unknown-tool-use").is_ok_and(|pending| pending.is_none()));
+    }
+
+    #[test]
+    fn post_tool_use_missing_tool_use_id_is_not_bare_continue() {
+        let fixture = Fixture::new("post_tool_use_missing_tool_use_id_is_not_bare_continue");
+        let Some(root) = fixture.root.to_str() else {
+            assert_eq!(fixture.root.display().to_string(), "");
+            return;
+        };
+        let request = super::HookRequest {
+            cwd: root.to_string(),
+            hook_event_name: "PostToolUse".to_string(),
+            tool_name: Some("apply_patch".to_string()),
+            tool_input: serde_json::Value::Null,
+            tool_response: serde_json::json!({ "isError": false }),
+            tool_use_id: None,
+        };
+
+        let output = super::post_tool_use(&request);
+
+        assert_ne!(output, serde_json::json!({ "continue": true }));
+        assert_eq!(
+            output
+                .get("hookSpecificOutput")
+                .and_then(|value| value.get("hookEventName"))
+                .and_then(serde_json::Value::as_str),
+            Some("PostToolUse")
+        );
+        assert_eq!(count_files(state_root(root).join("receipts"), "json"), 0);
+    }
+
+    #[test]
     fn guarded_pending_keeps_transaction_until_completed() {
         let fixture = Fixture::new("guarded_pending_keeps_transaction_until_completed");
         let file = fixture.root.join("a.txt");
@@ -1891,7 +2093,6 @@ PATCH"#;
             &pending,
             super::ReceiptOutcome {
                 status: safeguard_protocol::ReceiptStatus::Accepted,
-                tool_success: true,
                 expected_result_verified: true,
                 validations_passed: true,
                 rollback_completed: None,
@@ -1910,7 +2111,6 @@ PATCH"#;
             &pending,
             super::ReceiptOutcome {
                 status: safeguard_protocol::ReceiptStatus::Accepted,
-                tool_success: true,
                 expected_result_verified: true,
                 validations_passed: true,
                 rollback_completed: None,
@@ -2011,6 +2211,72 @@ PATCH"#;
                 .and_then(serde_json::Value::as_str),
             Some("rolled_back")
         );
+    }
+
+    #[test]
+    fn accepted_post_tool_use_writes_prepared_then_accepted_receipts() {
+        let fixture = Fixture::new("accepted_post_tool_use_writes_prepared_then_accepted_receipts");
+        let file = fixture.root.join("a.txt");
+        assert!(std::fs::write(&file, "alpha").is_ok());
+        let Some(root) = fixture.root.to_str() else {
+            assert_eq!(fixture.root.display().to_string(), "");
+            return;
+        };
+        let command = r#"apply_patch <<'PATCH'
+*** Begin Patch
+*** Update File: a.txt
+@@
+-alpha
++beta
+*** End Patch
+PATCH"#;
+        let files = match plan_patch_files(root, command) {
+            Ok(files) => files,
+            Err(err) => {
+                assert_eq!(err.to_string(), "");
+                return;
+            }
+        };
+        let pending = match prepare_guarded_pending(
+            root,
+            "unit-accepted-post",
+            "Bash",
+            "bash_apply_patch",
+            files,
+        ) {
+            Ok(pending) => pending,
+            Err(err) => {
+                assert_eq!(err.to_string(), "");
+                return;
+            }
+        };
+        assert!(write_pending(&pending).is_ok());
+        assert!(std::fs::write(&file, "beta").is_ok());
+
+        let request = super::HookRequest {
+            cwd: root.to_string(),
+            hook_event_name: "PostToolUse".to_string(),
+            tool_name: Some("Bash".to_string()),
+            tool_input: serde_json::json!({ "command": command }),
+            tool_response: serde_json::json!({ "isError": false }),
+            tool_use_id: Some("unit-accepted-post".to_string()),
+        };
+        let output = super::post_tool_use(&request);
+
+        assert_eq!(
+            output.get("continue").and_then(serde_json::Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            receipt_statuses(root),
+            vec!["prepared".to_string(), "accepted".to_string()]
+        );
+        assert_eq!(count_files(state_root(root).join("evidence"), "json"), 1);
+        assert_eq!(
+            count_files(state_root(root).join("transactions"), "json"),
+            0
+        );
+        assert!(read_pending(root, "unit-accepted-post").is_ok_and(|pending| pending.is_none()));
     }
 
     #[test]
@@ -2396,11 +2662,157 @@ PATCH"#;
                 operation: safeguard_protocol::FileOperation::Modify,
                 before_digest: None,
                 expected_diff_digest: None,
+                requirement: Default::default(),
             });
 
         let enforced =
             enforce_explicit_contract(root, "Bash", "bash_apply_patch", &files, contract);
         assert!(enforced.is_ok());
+    }
+
+    #[test]
+    fn explicit_contract_rejects_missing_required_expected_change() {
+        let fixture = Fixture::new("explicit_contract_rejects_missing_required_expected_change");
+        let file = fixture.root.join("a.txt");
+        let other = fixture.root.join("b.txt");
+        assert!(std::fs::write(&file, "alpha").is_ok());
+        assert!(std::fs::write(&other, "bravo").is_ok());
+        let Some(root) = fixture.root.to_str() else {
+            assert_eq!(fixture.root.display().to_string(), "");
+            return;
+        };
+        let files = vec![super::PendingFile {
+            path: file.display().to_string(),
+            operation: "update".to_string(),
+            existed_before: true,
+            before_blake3: None,
+            expected_after_blake3: None,
+            patch_blake3: None,
+        }];
+        let mut contract = safeguard_protocol::ExecutionContract::v0_1("missing-required");
+        contract.capabilities.push(safeguard_protocol::Capability {
+            tool: "apply_patch".to_string(),
+            operation: "modify".to_string(),
+            resources: vec![file.display().to_string(), other.display().to_string()],
+            constraints: Default::default(),
+        });
+        for path in [file.display().to_string(), other.display().to_string()] {
+            contract
+                .expected_changes
+                .files
+                .push(safeguard_protocol::ExpectedFileChange {
+                    path,
+                    operation: safeguard_protocol::FileOperation::Modify,
+                    before_digest: None,
+                    expected_diff_digest: None,
+                    requirement: safeguard_protocol::ExpectedChangeRequirement::Required,
+                });
+        }
+
+        let enforced =
+            enforce_explicit_contract(root, "Bash", "bash_apply_patch", &files, contract);
+        assert!(enforced.is_err());
+    }
+
+    #[test]
+    fn explicit_contract_allows_missing_optional_expected_change() {
+        let fixture = Fixture::new("explicit_contract_allows_missing_optional_expected_change");
+        let file = fixture.root.join("a.txt");
+        let other = fixture.root.join("b.txt");
+        assert!(std::fs::write(&file, "alpha").is_ok());
+        assert!(std::fs::write(&other, "bravo").is_ok());
+        let Some(root) = fixture.root.to_str() else {
+            assert_eq!(fixture.root.display().to_string(), "");
+            return;
+        };
+        let files = vec![super::PendingFile {
+            path: file.display().to_string(),
+            operation: "update".to_string(),
+            existed_before: true,
+            before_blake3: None,
+            expected_after_blake3: None,
+            patch_blake3: None,
+        }];
+        let mut contract = safeguard_protocol::ExecutionContract::v0_1("missing-optional");
+        contract.capabilities.push(safeguard_protocol::Capability {
+            tool: "apply_patch".to_string(),
+            operation: "modify".to_string(),
+            resources: vec![file.display().to_string(), other.display().to_string()],
+            constraints: Default::default(),
+        });
+        contract
+            .expected_changes
+            .files
+            .push(safeguard_protocol::ExpectedFileChange {
+                path: file.display().to_string(),
+                operation: safeguard_protocol::FileOperation::Modify,
+                before_digest: None,
+                expected_diff_digest: None,
+                requirement: safeguard_protocol::ExpectedChangeRequirement::Required,
+            });
+        contract
+            .expected_changes
+            .files
+            .push(safeguard_protocol::ExpectedFileChange {
+                path: other.display().to_string(),
+                operation: safeguard_protocol::FileOperation::Modify,
+                before_digest: None,
+                expected_diff_digest: None,
+                requirement: safeguard_protocol::ExpectedChangeRequirement::Optional,
+            });
+
+        let enforced =
+            enforce_explicit_contract(root, "Bash", "bash_apply_patch", &files, contract);
+        assert!(enforced.is_ok());
+    }
+
+    #[test]
+    fn explicit_contract_enforces_allowed_write_roots() {
+        let fixture = Fixture::new("explicit_contract_enforces_allowed_write_roots");
+        let allowed_dir = fixture.root.join("allowed");
+        let denied_dir = fixture.root.join("denied");
+        assert!(std::fs::create_dir_all(&allowed_dir).is_ok());
+        assert!(std::fs::create_dir_all(&denied_dir).is_ok());
+        let file = denied_dir.join("a.txt");
+        assert!(std::fs::write(&file, "alpha").is_ok());
+        let Some(root) = fixture.root.to_str() else {
+            assert_eq!(fixture.root.display().to_string(), "");
+            return;
+        };
+        let files = vec![super::PendingFile {
+            path: file.display().to_string(),
+            operation: "update".to_string(),
+            existed_before: true,
+            before_blake3: None,
+            expected_after_blake3: None,
+            patch_blake3: None,
+        }];
+        let mut constraints = std::collections::BTreeMap::new();
+        constraints.insert(
+            "allowed_write_roots".to_string(),
+            serde_json::json!(["allowed/**"]),
+        );
+        let mut contract = safeguard_protocol::ExecutionContract::v0_1("allowed-roots");
+        contract.capabilities.push(safeguard_protocol::Capability {
+            tool: "apply_patch".to_string(),
+            operation: "modify".to_string(),
+            resources: vec![file.display().to_string()],
+            constraints,
+        });
+        contract
+            .expected_changes
+            .files
+            .push(safeguard_protocol::ExpectedFileChange {
+                path: file.display().to_string(),
+                operation: safeguard_protocol::FileOperation::Modify,
+                before_digest: None,
+                expected_diff_digest: None,
+                requirement: safeguard_protocol::ExpectedChangeRequirement::Required,
+            });
+
+        let enforced =
+            enforce_explicit_contract(root, "Bash", "bash_apply_patch", &files, contract);
+        assert!(enforced.is_err());
     }
 
     #[test]
@@ -2435,6 +2847,7 @@ PATCH"#;
                 operation: safeguard_protocol::FileOperation::Modify,
                 before_digest: None,
                 expected_diff_digest: Some("expected-different-digest".to_string()),
+                requirement: Default::default(),
             });
 
         let enforced =
@@ -2490,6 +2903,14 @@ PATCH"#;
             .count()
     }
 
+    fn pre_tool_use_denied(output: &serde_json::Value) -> bool {
+        output
+            .get("hookSpecificOutput")
+            .and_then(|value| value.get("permissionDecision"))
+            .and_then(serde_json::Value::as_str)
+            == Some("deny")
+    }
+
     fn receipt_field(path: &PathBuf, field: &str) -> Option<String> {
         let bytes = std::fs::read(path).ok()?;
         let value: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
@@ -2507,6 +2928,29 @@ PATCH"#;
             .find(|path| path.extension().and_then(|value| value.to_str()) == Some("json"))?;
         let bytes = std::fs::read(path).ok()?;
         serde_json::from_slice(&bytes).ok()
+    }
+
+    fn receipt_statuses(root: &str) -> Vec<String> {
+        let Ok(entries) = std::fs::read_dir(state_root(root).join("receipts")) else {
+            return Vec::new();
+        };
+        let mut paths = entries
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .filter(|path| path.extension().and_then(|value| value.to_str()) == Some("json"))
+            .collect::<Vec<_>>();
+        paths.sort();
+        paths
+            .into_iter()
+            .filter_map(|path| {
+                let bytes = std::fs::read(path).ok()?;
+                let value: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+                value
+                    .get("status")
+                    .and_then(serde_json::Value::as_str)
+                    .map(ToString::to_string)
+            })
+            .collect()
     }
 
     struct Fixture {

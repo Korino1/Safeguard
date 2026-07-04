@@ -998,6 +998,7 @@ mod tests {
             operation: FileOperation::Modify,
             before_digest: Some("digest-before".to_string()),
             expected_diff_digest: None,
+            requirement: Default::default(),
         });
 
         let id = transaction_id_from_contract(&contract);

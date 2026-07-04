@@ -251,7 +251,7 @@ fn tools_call_response(id: Value, request: &Value) -> Value {
                         "isError": false
                     }
                 }),
-                Err(err) => tool_text(id, format!("rejected: {err:?}")),
+                Err(err) => tool_error_text(id, format!("rejected: {err:?}")),
             }
         }
         "sg_dry" => {
@@ -264,12 +264,12 @@ fn tools_call_response(id: Value, request: &Value) -> Value {
 
             let path = match resolve_allowed_path(&args.path) {
                 Ok(path) => path,
-                Err(err) => return tool_text(id, format!("rejected: {err}")),
+                Err(err) => return tool_error_text(id, format!("rejected: {err}")),
             };
 
             match safeguard_core::plan_text_file_replacement(&path, &args.old, &args.new) {
                 Ok(plan) => replacement_plan_result(id, "planned", &plan),
-                Err(err) => tool_text(id, format!("rejected: {err}")),
+                Err(err) => tool_error_text(id, format!("rejected: {err}")),
             }
         }
         "sg_apply" => {
@@ -282,18 +282,20 @@ fn tools_call_response(id: Value, request: &Value) -> Value {
 
             let path = match resolve_allowed_path(&args.path) {
                 Ok(path) => path,
-                Err(err) => return tool_text(id, format!("rejected: {err}")),
+                Err(err) => return tool_error_text(id, format!("rejected: {err}")),
             };
 
             match safeguard_core::plan_text_file_replacement(&path, &args.old, &args.new) {
                 Ok(plan) => match apply_transactional_replacement(&plan) {
                     Ok(()) => match append_audit_record("sg_apply", &plan) {
                         Ok(()) => replacement_plan_result(id, "applied", &plan),
-                        Err(err) => tool_text(id, format!("applied; audit write failed: {err}")),
+                        Err(err) => {
+                            tool_error_text(id, format!("applied; audit write failed: {err}"))
+                        }
                     },
-                    Err(err) => tool_text(id, format!("rejected: {err}")),
+                    Err(err) => tool_error_text(id, format!("rejected: {err}")),
                 },
-                Err(err) => tool_text(id, format!("rejected: {err}")),
+                Err(err) => tool_error_text(id, format!("rejected: {err}")),
             }
         }
         "sg_audit" => {
@@ -305,7 +307,7 @@ fn tools_call_response(id: Value, request: &Value) -> Value {
                 .unwrap_or(10);
             match read_audit_summary(limit) {
                 Ok(summary) => tool_json_text(id, summary),
-                Err(err) => tool_text(id, format!("rejected: {err}")),
+                Err(err) => tool_error_text(id, format!("rejected: {err}")),
             }
         }
         _ => json!({
@@ -320,10 +322,18 @@ fn tools_call_response(id: Value, request: &Value) -> Value {
 }
 
 fn tool_text(id: Value, text: String) -> Value {
-    tool_json_text(id, Value::String(text))
+    tool_json_text_with_error(id, Value::String(text), false)
+}
+
+fn tool_error_text(id: Value, text: String) -> Value {
+    tool_json_text_with_error(id, Value::String(text), true)
 }
 
 fn tool_json_text(id: Value, text: Value) -> Value {
+    tool_json_text_with_error(id, text, false)
+}
+
+fn tool_json_text_with_error(id: Value, text: Value, is_error: bool) -> Value {
     let text = match text {
         Value::String(text) => text,
         value => value.to_string(),
@@ -339,7 +349,7 @@ fn tool_json_text(id: Value, text: Value) -> Value {
                     "text": text
                 }
             ],
-            "isError": false
+            "isError": is_error
         }
     })
 }
@@ -609,6 +619,7 @@ mod tests {
         .unwrap_or_default();
 
         assert!(response.contains("Ambiguous"));
+        assert_tool_result_is_error(&response, "rejected:");
     }
 
     #[test]
@@ -667,7 +678,7 @@ mod tests {
     fn apply_rejects_internal_state_target() {
         let internal_dir = PathBuf::from(".safeguard");
         assert!(std::fs::create_dir_all(&internal_dir).is_ok());
-        let path = internal_dir.join("audit.jsonl");
+        let path = internal_dir.join(format!("blocked-test-{}-audit.jsonl", std::process::id()));
         assert!(std::fs::write(&path, "alpha").is_ok());
 
         let request = format!(
@@ -677,8 +688,36 @@ mod tests {
         let response = handle_line(&request).unwrap_or_default();
 
         assert!(response.contains("rejected"));
+        assert_tool_result_is_error(&response, "rejected:");
         assert!(std::fs::read_to_string(&path).is_ok_and(|value| value == "alpha"));
         let _ = std::fs::remove_file(&path);
+    }
+
+    fn assert_tool_result_is_error(response: &str, expected_text: &str) {
+        let value: serde_json::Value = match serde_json::from_str(response) {
+            Ok(value) => value,
+            Err(err) => {
+                assert_eq!(err.to_string(), "");
+                return;
+            }
+        };
+        assert_eq!(
+            value
+                .get("result")
+                .and_then(|result| result.get("isError"))
+                .and_then(serde_json::Value::as_bool),
+            Some(true)
+        );
+        assert!(
+            value
+                .get("result")
+                .and_then(|result| result.get("content"))
+                .and_then(serde_json::Value::as_array)
+                .and_then(|items| items.first())
+                .and_then(|item| item.get("text"))
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|text| text.contains(expected_text))
+        );
     }
 
     fn test_path(name: &str) -> PathBuf {

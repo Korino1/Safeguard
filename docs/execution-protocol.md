@@ -56,7 +56,8 @@ execution_contract:
         - "crates/example/src/lib.rs"
       constraints:
         max_files_changed: 1
-        text_only: true
+        allowed_write_roots:
+          - "crates/example/src/**"
     - tool: "Bash"
       operation: "execute"
       resources:
@@ -72,6 +73,7 @@ execution_contract:
         operation: "modify"
         before_digest: "optional"
         expected_diff_digest: "optional"
+        requirement: "required"
   required_validations:
     - command: "cargo fmt --check"
     - command: "cargo test -p example"
@@ -84,9 +86,13 @@ execution_contract:
 
 - `contract_id` is the stable correlation key across Safeguard, Cabal, and MemoryX.
 - `capabilities` define allowed operations. Anything not allowed is denied by default.
+- Contracts are validated before authorization as `ParsedContract -> VerifiedContract -> ActiveContract`.
+- Schema v0.1 validators currently require a supported `schema_version`, non-expired `expires_at`, trusted local issuer policy, matching workspace root, allowed roots inside the workspace, and known capability constraints.
+- Unknown mandatory capability constraints are denied by default. Current known constraint keys are `max_files_changed`, `network`, `allowed_write_roots`, and `validation_timeout_seconds`.
 - In schema v0.1, `capabilities[].operation` is accepted as either a tool action such as `invoke` or a resource operation such as `add`, `modify`, or `delete`. Safeguard treats `tool: apply_patch` as the patch invocation authority even when Codex delivered it through a shell-wrapped `apply_patch` hook event.
 - `denied_resources` override allowed capabilities.
 - `expected_changes` bind the intended result to files, operations, and optional digests.
+- `expected_changes.files[].requirement` defaults to `required`. Required expected changes must be observed before acceptance. Optional expected changes are allowed but not mandatory.
 - `required_validations` define checks that must be attached to the receipt before acceptance.
 - `invariants` define acceptance conditions.
 
@@ -128,6 +134,16 @@ execution_receipt:
   previous_receipt_hash: "digest-or-null"
   signature: null
 ```
+
+Receipt status values:
+
+- `prepared`: execution is durably prepared but not finally accepted;
+- `accepted`: final success after transaction completion;
+- `rejected`: denied or rejected execution;
+- `partial`: incomplete state requiring quarantine/recovery handling;
+- `rolled_back`: rollback completed.
+
+`accepted` is final-only. Safeguard must not emit an accepted receipt before transaction completion succeeds.
 
 ### Receipt Semantics
 
