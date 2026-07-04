@@ -1,5 +1,6 @@
 //! Codex lifecycle hook guard for transparent Safeguard protection.
 
+use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::io::Read;
 use std::io::Write;
@@ -350,7 +351,7 @@ fn post_tool_use(request: &HookRequest) -> Value {
         });
     }
     let started_at = transaction_started_at(&pending).unwrap_or_else(current_unix_timestamp);
-    let (validations, validations_passed) =
+    let (validations, validations_passed, validation_side_effects) =
         run_required_validations(&pending, success && expected_result_verified);
     let accepted = success && expected_result_verified && validations_passed;
     let mut receipt_status = if accepted {
@@ -360,57 +361,199 @@ fn post_tool_use(request: &HookRequest) -> Value {
     };
     let mut rollback_completed = None;
     let mut completion_error = None;
+    let mut receipt_written = false;
+    let mut transaction_cleaned = false;
 
     match safeguard_transaction::TransactionId::new(pending.transaction_id.clone()) {
         Ok(id) if accepted => {
-            if let Err(err) =
-                safeguard_transaction::complete_transaction(state_root(&pending.cwd), &id)
-            {
-                receipt_status = safeguard_protocol::ReceiptStatus::Partial;
-                completion_error = Some(model_safe_transaction_error(err).to_string());
-                let _ = write_quarantine_marker(&pending, "commit_failed");
-            }
-        }
-        Ok(id) => {
-            match safeguard_transaction::rollback_transaction(state_root(&pending.cwd), &id) {
-                Ok(Some(_record)) => {
-                    rollback_completed = Some(true);
-                }
-                Ok(None) => {
-                    receipt_status = safeguard_protocol::ReceiptStatus::Partial;
-                    rollback_completed = Some(false);
-                    completion_error = Some("transaction record not found".to_string());
-                    let _ = write_quarantine_marker(&pending, "rollback_record_missing");
+            match write_execution_receipt(
+                &pending,
+                ReceiptOutcome {
+                    status: receipt_status.clone(),
+                    tool_success: success,
+                    expected_result_verified,
+                    validations_passed,
+                    rollback_completed,
+                    completion_error: completion_error.clone(),
+                },
+                started_at,
+                changed_files.clone(),
+                validations.clone(),
+            ) {
+                Ok(_) => {
+                    receipt_written = true;
+                    match safeguard_transaction::complete_transaction(state_root(&pending.cwd), &id)
+                    {
+                        Ok(()) => {
+                            transaction_cleaned = true;
+                        }
+                        Err(err) => {
+                            receipt_status = safeguard_protocol::ReceiptStatus::Partial;
+                            completion_error = Some(model_safe_transaction_error(err).to_string());
+                            let _ = write_quarantine_marker(&pending, "commit_failed");
+                            let _ = write_execution_receipt(
+                                &pending,
+                                ReceiptOutcome {
+                                    status: receipt_status.clone(),
+                                    tool_success: success,
+                                    expected_result_verified,
+                                    validations_passed,
+                                    rollback_completed,
+                                    completion_error: completion_error.clone(),
+                                },
+                                started_at,
+                                changed_files.clone(),
+                                validations.clone(),
+                            );
+                        }
+                    }
                 }
                 Err(err) => {
                     receipt_status = safeguard_protocol::ReceiptStatus::Partial;
-                    rollback_completed = Some(false);
-                    completion_error = Some(model_safe_transaction_error(err).to_string());
-                    let _ = write_quarantine_marker(&pending, "rollback_failed");
+                    completion_error = Some(format!("receipt write failed: {err}"));
+                    let _ = write_quarantine_marker(&pending, "receipt_write_failed");
                 }
             }
         }
+        Ok(id) => match safeguard_transaction::restore_transaction(state_root(&pending.cwd), &id) {
+            Ok(Some(_record)) => {
+                rollback_completed = Some(true);
+                if validation_side_effects {
+                    receipt_status = safeguard_protocol::ReceiptStatus::Partial;
+                    completion_error =
+                        Some("validation modified undeclared workspace files".to_string());
+                    let _ = write_quarantine_marker(&pending, "validation_side_effects");
+                }
+                match write_execution_receipt(
+                    &pending,
+                    ReceiptOutcome {
+                        status: receipt_status.clone(),
+                        tool_success: success,
+                        expected_result_verified,
+                        validations_passed,
+                        rollback_completed,
+                        completion_error: completion_error.clone(),
+                    },
+                    started_at,
+                    changed_files.clone(),
+                    validations.clone(),
+                ) {
+                    Ok(_) => {
+                        receipt_written = true;
+                        if !validation_side_effects {
+                            match safeguard_transaction::complete_transaction(
+                                state_root(&pending.cwd),
+                                &id,
+                            ) {
+                                Ok(()) => {
+                                    transaction_cleaned = true;
+                                }
+                                Err(err) => {
+                                    receipt_status = safeguard_protocol::ReceiptStatus::Partial;
+                                    completion_error =
+                                        Some(model_safe_transaction_error(err).to_string());
+                                    let _ = write_quarantine_marker(
+                                        &pending,
+                                        "rollback_cleanup_failed",
+                                    );
+                                    let _ = write_execution_receipt(
+                                        &pending,
+                                        ReceiptOutcome {
+                                            status: receipt_status.clone(),
+                                            tool_success: success,
+                                            expected_result_verified,
+                                            validations_passed,
+                                            rollback_completed,
+                                            completion_error: completion_error.clone(),
+                                        },
+                                        started_at,
+                                        changed_files.clone(),
+                                        validations.clone(),
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    Err(err) => {
+                        receipt_status = safeguard_protocol::ReceiptStatus::Partial;
+                        completion_error = Some(format!("receipt write failed: {err}"));
+                        let _ = write_quarantine_marker(&pending, "receipt_write_failed");
+                    }
+                }
+            }
+            Ok(None) => {
+                receipt_status = safeguard_protocol::ReceiptStatus::Partial;
+                rollback_completed = Some(false);
+                completion_error = Some("transaction record not found".to_string());
+                let _ = write_quarantine_marker(&pending, "rollback_record_missing");
+                if write_execution_receipt(
+                    &pending,
+                    ReceiptOutcome {
+                        status: receipt_status.clone(),
+                        tool_success: success,
+                        expected_result_verified,
+                        validations_passed,
+                        rollback_completed,
+                        completion_error: completion_error.clone(),
+                    },
+                    started_at,
+                    changed_files.clone(),
+                    validations.clone(),
+                )
+                .is_ok()
+                {
+                    receipt_written = true;
+                }
+            }
+            Err(err) => {
+                receipt_status = safeguard_protocol::ReceiptStatus::Partial;
+                rollback_completed = Some(false);
+                completion_error = Some(model_safe_transaction_error(err).to_string());
+                let _ = write_quarantine_marker(&pending, "rollback_failed");
+                if write_execution_receipt(
+                    &pending,
+                    ReceiptOutcome {
+                        status: receipt_status.clone(),
+                        tool_success: success,
+                        expected_result_verified,
+                        validations_passed,
+                        rollback_completed,
+                        completion_error: completion_error.clone(),
+                    },
+                    started_at,
+                    changed_files.clone(),
+                    validations.clone(),
+                )
+                .is_ok()
+                {
+                    receipt_written = true;
+                }
+            }
+        },
         Err(err) => {
             receipt_status = safeguard_protocol::ReceiptStatus::Partial;
             completion_error = Some(model_safe_transaction_error(err).to_string());
             let _ = write_quarantine_marker(&pending, "invalid_transaction_id");
+            if write_execution_receipt(
+                &pending,
+                ReceiptOutcome {
+                    status: receipt_status.clone(),
+                    tool_success: success,
+                    expected_result_verified,
+                    validations_passed,
+                    rollback_completed,
+                    completion_error: completion_error.clone(),
+                },
+                started_at,
+                changed_files.clone(),
+                validations.clone(),
+            )
+            .is_ok()
+            {
+                receipt_written = true;
+            }
         }
     }
-
-    let _ = write_execution_receipt(
-        &pending,
-        ReceiptOutcome {
-            status: receipt_status.clone(),
-            tool_success: success,
-            expected_result_verified,
-            validations_passed,
-            rollback_completed,
-            completion_error: completion_error.clone(),
-        },
-        started_at,
-        changed_files,
-        validations,
-    );
 
     let _ = append_policy_audit(
         &pending.cwd,
@@ -424,12 +567,18 @@ fn post_tool_use(request: &HookRequest) -> Value {
             "success": success,
             "verified": expected_result_verified,
             "validations_passed": validations_passed,
+            "validation_side_effects": validation_side_effects,
             "receipt_status": format!("{:?}", receipt_status),
+            "receipt_written": receipt_written,
+            "transaction_cleaned": transaction_cleaned,
             "completion_error": completion_error,
             "files": files
         }),
     );
-    if receipt_status != safeguard_protocol::ReceiptStatus::Partial {
+    if receipt_status != safeguard_protocol::ReceiptStatus::Partial
+        && receipt_written
+        && transaction_cleaned
+    {
         let _ = remove_pending(&request.cwd, tool_use_id);
     }
     continue_output()
@@ -627,7 +776,18 @@ fn expected_change_matches(
     contract.expected_changes.files.iter().any(|expected| {
         expected.operation == protocol_file_operation(&file.operation)
             && resource_matches(cwd, &expected.path, &file.path)
+            && expected_diff_matches(expected, file)
     })
+}
+
+fn expected_diff_matches(
+    expected: &safeguard_protocol::ExpectedFileChange,
+    file: &PendingFile,
+) -> bool {
+    expected
+        .expected_diff_digest
+        .as_deref()
+        .is_none_or(|digest| file.patch_blake3.as_deref() == Some(digest))
 }
 
 fn capability_matches(
@@ -738,16 +898,24 @@ fn transaction_started_at(pending: &PendingEdit) -> Option<u64> {
 fn run_required_validations(
     pending: &PendingEdit,
     should_run: bool,
-) -> (Vec<safeguard_protocol::ValidationResult>, bool) {
+) -> (Vec<safeguard_protocol::ValidationResult>, bool, bool) {
     let mut all_passed = true;
+    let mut changed_workspace = false;
     let results = pending
         .required_validations
         .iter()
         .map(|command| {
             let status = if should_run {
-                match run_validation_command(&pending.cwd, command) {
-                    Ok(true) => safeguard_protocol::ValidationStatus::Passed,
-                    Ok(false) | Err(_) => {
+                match run_validation_command_guarded(&pending.cwd, command) {
+                    Ok(ValidationCommandOutcome::Passed) => {
+                        safeguard_protocol::ValidationStatus::Passed
+                    }
+                    Ok(ValidationCommandOutcome::ChangedWorkspace) => {
+                        changed_workspace = true;
+                        all_passed = false;
+                        safeguard_protocol::ValidationStatus::Failed
+                    }
+                    Ok(ValidationCommandOutcome::Failed) | Err(_) => {
                         all_passed = false;
                         safeguard_protocol::ValidationStatus::Failed
                     }
@@ -762,17 +930,87 @@ fn run_required_validations(
             }
         })
         .collect::<Vec<_>>();
-    (results, all_passed)
+    (results, all_passed, changed_workspace)
 }
 
-fn run_validation_command(cwd: &str, command: &str) -> anyhow::Result<bool> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ValidationCommandOutcome {
+    Passed,
+    Failed,
+    ChangedWorkspace,
+}
+
+fn run_validation_command_guarded(
+    cwd: &str,
+    command: &str,
+) -> anyhow::Result<ValidationCommandOutcome> {
+    let before = workspace_manifest(cwd)?;
     let status = validation_shell_command(command)
         .current_dir(cwd)
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .status()
         .with_context(|| format!("failed to run validation command: {command}"))?;
-    Ok(status.success())
+    if !status.success() {
+        return Ok(ValidationCommandOutcome::Failed);
+    }
+    let after = workspace_manifest(cwd)?;
+    if workspace_manifest_changed(&before, &after) {
+        return Ok(ValidationCommandOutcome::ChangedWorkspace);
+    }
+    Ok(ValidationCommandOutcome::Passed)
+}
+
+fn workspace_manifest(cwd: &str) -> anyhow::Result<BTreeMap<String, String>> {
+    let root = PathBuf::from(cwd)
+        .canonicalize()
+        .with_context(|| format!("failed to canonicalize cwd {cwd}"))?;
+    let mut manifest = BTreeMap::new();
+    collect_workspace_manifest(&root, &root, &mut manifest)?;
+    Ok(manifest)
+}
+
+fn collect_workspace_manifest(
+    root: &Path,
+    dir: &Path,
+    manifest: &mut BTreeMap<String, String>,
+) -> anyhow::Result<()> {
+    for entry in
+        std::fs::read_dir(dir).with_context(|| format!("failed to read {}", dir.display()))?
+    {
+        let entry = entry?;
+        let path = entry.path();
+        let file_name = entry.file_name();
+        if should_skip_manifest_entry(&file_name.to_string_lossy()) {
+            continue;
+        }
+        let file_type = entry.file_type()?;
+        if file_type.is_dir() {
+            collect_workspace_manifest(root, &path, manifest)?;
+        } else if file_type.is_file() {
+            let relative = path
+                .strip_prefix(root)
+                .unwrap_or(&path)
+                .display()
+                .to_string();
+            let digest = std::fs::read(&path)
+                .map(|bytes| safeguard_core::blake3_hex(&bytes).as_hex().to_string())
+                .with_context(|| format!("failed to hash {}", path.display()))?;
+            manifest.insert(relative, digest);
+        }
+    }
+    Ok(())
+}
+
+fn should_skip_manifest_entry(name: &str) -> bool {
+    matches!(name, ".git" | ".safeguard" | "target")
+}
+
+fn workspace_manifest_changed(
+    before: &BTreeMap<String, String>,
+    after: &BTreeMap<String, String>,
+) -> bool {
+    before != after
 }
 
 #[cfg(windows)]
@@ -1037,14 +1275,20 @@ fn commit_receipt(
         .create_new(true)
         .open(&path)?;
     file.write_all(&serde_json::to_vec_pretty(&receipt)?)?;
-    write_receipt_chain_head(
+    file.sync_all()?;
+    drop(file);
+
+    if let Err(err) = write_receipt_chain_head(
         &state_root,
         &ReceiptChainHead {
             sequence,
             receipt_hash,
             receipt_path: path.display().to_string(),
         },
-    )?;
+    ) {
+        let _ = std::fs::remove_file(&path);
+        return Err(err);
+    }
     Ok(path)
 }
 
@@ -1063,12 +1307,27 @@ fn acquire_receipt_chain_lock(state_root: &Path) -> anyhow::Result<ReceiptChainL
                 return Ok(ReceiptChainLock { path });
             }
             Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+                let _ = remove_stale_receipt_chain_lock(&path);
                 std::thread::sleep(Duration::from_millis(20));
             }
             Err(err) => return Err(err.into()),
         }
     }
     anyhow::bail!("receipt chain lock is held")
+}
+
+fn remove_stale_receipt_chain_lock(path: &Path) -> anyhow::Result<()> {
+    const STALE_AFTER: Duration = Duration::from_secs(300);
+    let metadata = std::fs::metadata(path)?;
+    let modified = metadata.modified()?;
+    if modified
+        .elapsed()
+        .map(|elapsed| elapsed >= STALE_AFTER)
+        .unwrap_or(false)
+    {
+        std::fs::remove_file(path)?;
+    }
+    Ok(())
 }
 
 fn load_receipt_chain_head(state_root: &Path) -> Option<ReceiptChainHead> {
@@ -1081,9 +1340,18 @@ fn write_receipt_chain_head(state_root: &Path, head: &ReceiptChainHead) -> anyho
     let dir = state_root.join("receipt-chain");
     std::fs::create_dir_all(&dir)?;
     let path = dir.join("head.json");
-    let temp_path = dir.join("head.tmp");
-    std::fs::write(&temp_path, serde_json::to_vec_pretty(head)?)?;
-    std::fs::rename(temp_path, path)?;
+    let temp_path = dir.join(format!("head.{}.tmp", std::process::id()));
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temp_path)?;
+    file.write_all(&serde_json::to_vec_pretty(head)?)?;
+    file.sync_all()?;
+    drop(file);
+    if path.exists() {
+        std::fs::remove_file(&path)?;
+    }
+    std::fs::rename(&temp_path, path)?;
     Ok(())
 }
 
@@ -1285,33 +1553,91 @@ fn updated_file_content(original: &str, section: &[String]) -> anyhow::Result<St
     let (original_lines, trailing_newline) = split_patch_text(original);
     let mut output = Vec::new();
     let mut index = 0usize;
-    for line in section {
-        if line.starts_with("@@") {
-            continue;
-        }
-        if let Some(expected) = line.strip_prefix(' ') {
-            let Some(actual) = original_lines.get(index) else {
-                anyhow::bail!("patch context exceeds original file");
-            };
-            if actual != expected {
-                anyhow::bail!("patch context does not match original file");
+    for hunk in update_hunks(section) {
+        let anchor = find_hunk_anchor(&original_lines, index, hunk)?;
+        output.extend(original_lines.iter().take(anchor).skip(index).cloned());
+        index = anchor;
+        for line in hunk {
+            if line.starts_with("@@") {
+                continue;
             }
-            output.push(actual.clone());
-            index += 1;
-        } else if let Some(expected) = line.strip_prefix('-') {
-            let Some(actual) = original_lines.get(index) else {
-                anyhow::bail!("patch removal exceeds original file");
-            };
-            if actual != expected {
-                anyhow::bail!("patch removal does not match original file");
+            if let Some(expected) = line.strip_prefix(' ') {
+                let Some(actual) = original_lines.get(index) else {
+                    anyhow::bail!("patch context exceeds original file");
+                };
+                if actual != expected {
+                    anyhow::bail!("patch context does not match original file");
+                }
+                output.push(actual.clone());
+                index += 1;
+            } else if let Some(expected) = line.strip_prefix('-') {
+                let Some(actual) = original_lines.get(index) else {
+                    anyhow::bail!("patch removal exceeds original file");
+                };
+                if actual != expected {
+                    anyhow::bail!("patch removal does not match original file");
+                }
+                index += 1;
+            } else if let Some(added) = line.strip_prefix('+') {
+                output.push(added.to_string());
             }
-            index += 1;
-        } else if let Some(added) = line.strip_prefix('+') {
-            output.push(added.to_string());
         }
     }
     output.extend(original_lines.into_iter().skip(index));
     Ok(join_patch_lines(output, trailing_newline))
+}
+
+fn update_hunks(section: &[String]) -> Vec<&[String]> {
+    let mut hunks = Vec::new();
+    let mut start = 0usize;
+    let mut saw_header = false;
+    for (index, line) in section.iter().enumerate() {
+        if line.starts_with("@@") {
+            if saw_header && start < index {
+                hunks.push(&section[start..index]);
+            }
+            saw_header = true;
+            start = index + 1;
+        }
+    }
+    if start < section.len() {
+        hunks.push(&section[start..]);
+    }
+    if hunks.is_empty() && !section.is_empty() {
+        hunks.push(section);
+    }
+    hunks
+}
+
+fn find_hunk_anchor(
+    original_lines: &[String],
+    start_index: usize,
+    hunk: &[String],
+) -> anyhow::Result<usize> {
+    let expected = hunk
+        .iter()
+        .filter_map(|line| {
+            line.strip_prefix(' ')
+                .or_else(|| line.strip_prefix('-'))
+                .map(str::to_string)
+        })
+        .collect::<Vec<_>>();
+    if expected.is_empty() {
+        return Ok(start_index);
+    }
+    for candidate in start_index..=original_lines.len() {
+        if hunk_matches_at(original_lines, candidate, &expected) {
+            return Ok(candidate);
+        }
+    }
+    anyhow::bail!("patch hunk does not match original file")
+}
+
+fn hunk_matches_at(original_lines: &[String], start_index: usize, expected: &[String]) -> bool {
+    if start_index + expected.len() > original_lines.len() {
+        return false;
+    }
+    original_lines[start_index..start_index + expected.len()] == *expected
 }
 
 fn split_patch_text(value: &str) -> (Vec<String>, bool) {
@@ -1466,10 +1792,10 @@ fn stable_id_for_command(command: &str) -> String {
 
 fn preview(command: &str) -> String {
     const MAX: usize = 160;
-    if command.len() <= MAX {
+    if command.chars().count() <= MAX {
         command.to_string()
     } else {
-        format!("{}...", &command[..MAX])
+        format!("{}...", command.chars().take(MAX).collect::<String>())
     }
 }
 
@@ -1516,6 +1842,14 @@ PATCH"#,
         assert!(is_risky_shell_write("Set-Content file.txt value"));
         assert!(is_risky_shell_write("cat > file.txt"));
         assert!(!is_risky_shell_write("cargo test --workspace"));
+    }
+
+    #[test]
+    fn preview_is_utf8_safe() {
+        let command = "Ж".repeat(200);
+        let value = super::preview(&command);
+        assert!(value.ends_with("..."));
+        assert_eq!(value.trim_end_matches("...").chars().count(), 160);
     }
 
     #[test]
@@ -1828,6 +2162,38 @@ PATCH"#;
     }
 
     #[test]
+    fn plans_expected_after_digest_for_middle_hunk() {
+        let fixture = Fixture::new("plans_expected_after_digest_for_middle_hunk");
+        let file = fixture.root.join("a.txt");
+        assert!(std::fs::write(&file, "one\ntwo\nthree\n").is_ok());
+        let Some(root) = fixture.root.to_str() else {
+            assert_eq!(fixture.root.display().to_string(), "");
+            return;
+        };
+        let command = r#"apply_patch <<'PATCH'
+*** Begin Patch
+*** Update File: a.txt
+@@
+ two
+-three
++THREE
+*** End Patch
+PATCH"#;
+        let files = plan_patch_files(root, command);
+        assert!(files.as_ref().is_ok_and(|files| files.len() == 1));
+        let expected = safeguard_core::blake3_hex(b"one\ntwo\nTHREE\n")
+            .as_hex()
+            .to_string();
+        assert_eq!(
+            files
+                .ok()
+                .and_then(|mut files| files.pop())
+                .and_then(|file| file.expected_after_blake3),
+            Some(expected)
+        );
+    }
+
+    #[test]
     fn rejects_patch_target_inside_internal_state() {
         let fixture = Fixture::new("rejects_patch_target_inside_internal_state");
         let internal_dir = fixture.root.join(".safeguard");
@@ -1869,13 +2235,132 @@ PATCH"#;
             files: Vec::new(),
         };
 
-        let (validations, passed) = run_required_validations(&pending, true);
+        let (validations, passed, changed_workspace) = run_required_validations(&pending, true);
 
         assert!(!passed);
+        assert!(!changed_workspace);
         assert_eq!(validations.len(), 1);
         assert_eq!(
             validations[0].status,
             safeguard_protocol::ValidationStatus::Failed
+        );
+    }
+
+    #[test]
+    fn validation_side_effect_is_not_accepted() {
+        let fixture = Fixture::new("validation_side_effect_is_not_accepted");
+        let Some(root) = fixture.root.to_str() else {
+            assert_eq!(fixture.root.display().to_string(), "");
+            return;
+        };
+        #[cfg(windows)]
+        let command = "Set-Content -NoNewline side-effect.txt beta";
+        #[cfg(not(windows))]
+        let command = "printf beta > side-effect.txt";
+        let pending = super::PendingEdit {
+            tool_use_id: "validation-side-effect".to_string(),
+            tool_name: "Bash".to_string(),
+            cwd: root.to_string(),
+            command_kind: "bash_apply_patch".to_string(),
+            contract_id: "validation-side-effect".to_string(),
+            transaction_id: "validation-side-effect".to_string(),
+            transaction_record_path: String::new(),
+            contract_hash: None,
+            required_validations: vec![command.to_string()],
+            files: Vec::new(),
+        };
+
+        let (validations, passed, changed_workspace) = run_required_validations(&pending, true);
+
+        assert!(!passed);
+        assert!(changed_workspace);
+        assert_eq!(validations.len(), 1);
+        assert_eq!(
+            validations[0].status,
+            safeguard_protocol::ValidationStatus::Failed
+        );
+    }
+
+    #[test]
+    fn validation_side_effect_keeps_transaction_partial() {
+        let fixture = Fixture::new("validation_side_effect_keeps_transaction_partial");
+        let file = fixture.root.join("a.txt");
+        assert!(std::fs::write(&file, "alpha").is_ok());
+        let Some(root) = fixture.root.to_str() else {
+            assert_eq!(fixture.root.display().to_string(), "");
+            return;
+        };
+        let command = r#"apply_patch <<'PATCH'
+*** Begin Patch
+*** Update File: a.txt
+@@
+-alpha
++beta
+*** End Patch
+PATCH"#;
+        let files = match plan_patch_files(root, command) {
+            Ok(files) => files,
+            Err(err) => {
+                assert_eq!(err.to_string(), "");
+                return;
+            }
+        };
+        let mut pending = match prepare_guarded_pending(
+            root,
+            "validation-side-effect-post",
+            "Bash",
+            "bash_apply_patch",
+            files,
+        ) {
+            Ok(pending) => pending,
+            Err(err) => {
+                assert_eq!(err.to_string(), "");
+                return;
+            }
+        };
+        let side_effect_path = fixture.root.join("side-effect.txt");
+        #[cfg(windows)]
+        let validation = format!(
+            "Set-Content -NoNewline -LiteralPath '{}' -Value beta",
+            side_effect_path.display()
+        );
+        #[cfg(not(windows))]
+        let validation = format!("printf beta > '{}'", side_effect_path.display());
+        pending.required_validations = vec![validation];
+        assert!(write_pending(&pending).is_ok());
+        assert!(std::fs::write(&file, "beta").is_ok());
+
+        let request = super::HookRequest {
+            cwd: root.to_string(),
+            hook_event_name: "PostToolUse".to_string(),
+            tool_name: Some("Bash".to_string()),
+            tool_input: serde_json::json!({ "command": command }),
+            tool_response: serde_json::json!({ "isError": false }),
+            tool_use_id: Some("validation-side-effect-post".to_string()),
+        };
+        let output = super::post_tool_use(&request);
+
+        assert_eq!(
+            output.get("continue").and_then(serde_json::Value::as_bool),
+            Some(true)
+        );
+        assert!(std::fs::read_to_string(&file).is_ok_and(|value| value == "alpha"));
+        assert!(side_effect_path.exists());
+        assert!(
+            read_pending(root, "validation-side-effect-post")
+                .is_ok_and(|pending| pending.is_some())
+        );
+        assert_eq!(
+            count_files(state_root(root).join("transactions"), "json"),
+            1
+        );
+        let receipt = first_receipt(root);
+        assert_eq!(
+            receipt
+                .as_ref()
+                .and_then(|value| value.get("status"))
+                .and_then(serde_json::Value::as_str),
+            Some("partial")
         );
     }
 
@@ -1916,6 +2401,45 @@ PATCH"#;
         let enforced =
             enforce_explicit_contract(root, "Bash", "bash_apply_patch", &files, contract);
         assert!(enforced.is_ok());
+    }
+
+    #[test]
+    fn explicit_contract_rejects_wrong_expected_diff_digest() {
+        let fixture = Fixture::new("explicit_contract_rejects_wrong_expected_diff_digest");
+        let file = fixture.root.join("a.txt");
+        assert!(std::fs::write(&file, "alpha").is_ok());
+        let Some(root) = fixture.root.to_str() else {
+            assert_eq!(fixture.root.display().to_string(), "");
+            return;
+        };
+        let files = vec![super::PendingFile {
+            path: file.display().to_string(),
+            operation: "update".to_string(),
+            existed_before: true,
+            before_blake3: None,
+            expected_after_blake3: Some(safeguard_core::blake3_hex(b"beta").as_hex().to_string()),
+            patch_blake3: Some("actual-patch-digest".to_string()),
+        }];
+        let mut contract = safeguard_protocol::ExecutionContract::v0_1("wrong-diff");
+        contract.capabilities.push(safeguard_protocol::Capability {
+            tool: "apply_patch".to_string(),
+            operation: "modify".to_string(),
+            resources: vec![file.display().to_string()],
+            constraints: Default::default(),
+        });
+        contract
+            .expected_changes
+            .files
+            .push(safeguard_protocol::ExpectedFileChange {
+                path: file.display().to_string(),
+                operation: safeguard_protocol::FileOperation::Modify,
+                before_digest: None,
+                expected_diff_digest: Some("expected-different-digest".to_string()),
+            });
+
+        let enforced =
+            enforce_explicit_contract(root, "Bash", "bash_apply_patch", &files, contract);
+        assert!(enforced.is_err());
     }
 
     #[test]

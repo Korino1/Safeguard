@@ -483,8 +483,9 @@ pub fn complete_transaction(
     Ok(())
 }
 
-/// Roll back a persisted transaction from its stored snapshots, then release locks.
-pub fn rollback_transaction(
+/// Restore target files from a persisted transaction without releasing locks or
+/// deleting rollback state.
+pub fn restore_transaction(
     state_root: impl AsRef<Path>,
     id: &TransactionId,
 ) -> Result<Option<TransactionRecord>, TransactionError> {
@@ -514,6 +515,18 @@ pub fn rollback_transaction(
         }
     }
 
+    Ok(Some(record))
+}
+
+/// Roll back a persisted transaction from its stored snapshots, then release locks.
+pub fn rollback_transaction(
+    state_root: impl AsRef<Path>,
+    id: &TransactionId,
+) -> Result<Option<TransactionRecord>, TransactionError> {
+    let state_root = state_root.as_ref();
+    let Some(record) = restore_transaction(state_root, id)? else {
+        return Ok(None);
+    };
     complete_transaction(state_root, id)?;
     Ok(Some(record))
 }
@@ -692,6 +705,7 @@ mod tests {
     use super::complete_transaction;
     use super::load_transaction_record;
     use super::recovery_candidates;
+    use super::restore_transaction;
     use super::rollback_transaction;
     use super::targets_from_contract;
     use super::transaction_id_from_contract;
@@ -822,6 +836,52 @@ mod tests {
                 .exists()
         );
         assert!(!fixture.state.join("rollback").join(id.as_str()).exists());
+    }
+
+    #[test]
+    fn restore_transaction_keeps_state_until_completed() {
+        let fixture = Fixture::new("restore_transaction_keeps_state_until_completed");
+        let file = fixture.workspace.join("a.txt");
+        assert!(std::fs::write(&file, "alpha").is_ok());
+        let id = valid_id("tx-restore");
+
+        let guard = match begin_transaction(
+            &fixture.workspace,
+            &fixture.state,
+            id.clone(),
+            &[TransactionTarget {
+                path: PathBuf::from("a.txt"),
+                expected_blake3: None,
+            }],
+        ) {
+            Ok(guard) => guard,
+            Err(err) => {
+                assert_eq!(err.to_string(), "");
+                return;
+            }
+        };
+        let lock_path = fixture
+            .state
+            .join("locks")
+            .join(format!("{}.lock", guard.targets()[0].lock_key));
+        assert!(guard.persist_record_keep_locks().is_ok());
+        assert!(std::fs::write(&file, "beta").is_ok());
+
+        let restored = restore_transaction(&fixture.state, &id);
+        assert!(restored.is_ok_and(|record| record.is_some()));
+        assert!(std::fs::read_to_string(&file).is_ok_and(|value| value == "alpha"));
+        assert!(lock_path.exists());
+        assert!(
+            fixture
+                .state
+                .join("transactions")
+                .join(format!("{}.json", id.as_str()))
+                .exists()
+        );
+        assert!(fixture.state.join("rollback").join(id.as_str()).exists());
+
+        assert!(complete_transaction(&fixture.state, &id).is_ok());
+        assert!(!lock_path.exists());
     }
 
     #[test]

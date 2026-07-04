@@ -1,6 +1,6 @@
 {
   "name": "safeguard",
-  "version": "1.2.0",
+  "version": "1.2.1",
   "description": "External Safeguard plugin for guarded Codex CLI file edits.",
   "author": {
     "name": "Safeguard Project"

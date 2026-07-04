@@ -398,8 +398,22 @@ fn resolve_allowed_path(path: &Path) -> anyhow::Result<PathBuf> {
             root.display()
         );
     }
+    reject_internal_state_target(&root, &canonical)?;
 
     Ok(canonical)
+}
+
+fn reject_internal_state_target(root: &Path, target: &Path) -> anyhow::Result<()> {
+    let state_root = root.join(".safeguard");
+    let state_root = if state_root.exists() {
+        state_root.canonicalize()?
+    } else {
+        state_root
+    };
+    if target.starts_with(state_root) {
+        anyhow::bail!("target is inside Safeguard internal state");
+    }
+    Ok(())
 }
 
 fn replacement_plan_result(
@@ -453,15 +467,25 @@ fn apply_transactional_replacement(
         anyhow::bail!("{err}");
     }
 
+    match verify_replacement_result(plan) {
+        Ok(()) => {
+            safeguard_transaction::complete_transaction(&state_root, &transaction_id)?;
+            Ok(())
+        }
+        Err(err) => {
+            let _ = safeguard_transaction::rollback_transaction(&state_root, &transaction_id);
+            Err(err)
+        }
+    }
+}
+
+fn verify_replacement_result(plan: &safeguard_core::FileReplacementPlan) -> anyhow::Result<()> {
     let after = std::fs::read(&plan.path)
         .map(|bytes| safeguard_core::blake3_hex(&bytes).as_hex().to_string())
         .with_context(|| format!("failed to verify {}", plan.path.display()))?;
     if after != plan.after_blake3.as_hex() {
-        let _ = safeguard_transaction::rollback_transaction(&state_root, &transaction_id);
         anyhow::bail!("replacement result did not match planned output");
     }
-
-    safeguard_transaction::complete_transaction(&state_root, &transaction_id)?;
     Ok(())
 }
 
@@ -636,6 +660,24 @@ mod tests {
         assert!(summary_response.contains(r#"\"total_records\":"#));
         assert!(!summary_response.to_lowercase().contains("blake3"));
 
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn apply_rejects_internal_state_target() {
+        let internal_dir = PathBuf::from(".safeguard");
+        assert!(std::fs::create_dir_all(&internal_dir).is_ok());
+        let path = internal_dir.join("audit.jsonl");
+        assert!(std::fs::write(&path, "alpha").is_ok());
+
+        let request = format!(
+            r#"{{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{{"name":"sg_apply","arguments":{{"path":{},"old":"alpha","new":"beta"}}}}}}"#,
+            serde_json::json!(path.display().to_string())
+        );
+        let response = handle_line(&request).unwrap_or_default();
+
+        assert!(response.contains("rejected"));
+        assert!(std::fs::read_to_string(&path).is_ok_and(|value| value == "alpha"));
         let _ = std::fs::remove_file(&path);
     }
 
