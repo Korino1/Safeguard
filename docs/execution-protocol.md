@@ -45,8 +45,8 @@ execution_contract:
     system: "cabal"
     run_id: "run-id"
   subject:
-    agent_id: "agent-id"
-    model: "model-id"
+    agent_id: null
+    model: null
   workspace:
     root: "."
     allowed_roots:
@@ -81,7 +81,7 @@ execution_contract:
 - `contract_id` is the stable correlation key across Safeguard, Cabal, and MemoryX.
 - `capabilities` define allowed operations. Anything not allowed is denied by default.
 - Contracts are validated before authorization as `ParsedContract -> VerifiedContract -> ActiveContract`.
-- Schema v0.1 validators currently require a supported `schema_version`, non-expired `expires_at`, trusted local issuer policy, matching workspace root, allowed roots inside the workspace, known enforceable capability constraints, and no unsupported contract invariants.
+- Schema v0.1 validators currently require a supported `schema_version`, non-expired `expires_at`, trusted local issuer policy, no unsupported subject binding, matching workspace root, allowed roots inside the workspace, known enforceable capability constraints, and no unsupported contract invariants.
 - Unknown mandatory capability constraints are denied by default.
 - Current enforced constraint keys are `max_files_changed` and `allowed_write_roots`.
 - `network` and `validation_timeout_seconds` are intentionally rejected as unsupported executable constraints until Safeguard can enforce network isolation, timeout, and process-tree termination.
@@ -91,6 +91,8 @@ execution_contract:
 - `expected_changes.files[].requirement` defaults to `required`. Required expected changes must be observed before acceptance. Optional expected changes are allowed but not mandatory.
 - `required_validations` define checks that must be attached to the receipt before acceptance. Current execution is blocking and not sandboxed.
 - `invariants` are reserved for future evaluator-backed checks. Non-empty contract invariants are rejected in v0.1 until an evaluator registry exists.
+- `subject.agent_id` and `subject.model` are reserved for future trusted runtime binding. Non-empty subject fields are rejected in v0.1 until Safeguard receives a trusted subject context.
+- Explicit contract files loaded through `SAFEGUARD_CONTRACT_PATH` must be outside the workspace and must match the wrapper-provided `SAFEGUARD_CONTRACT_BLAKE3` value. This is a local trust boundary, not a replacement for future Cabal signatures or trusted IPC.
 
 ## ExecutionReceipt v0.1
 
@@ -192,6 +194,7 @@ Implemented now:
 - initial transaction crate with locks, digest CAS, rollback snapshots, recovery candidate scan, and `ExecutionContract` target mapping;
 - hook-side implicit `ExecutionContract` binding for native `apply_patch`;
 - optional explicit `ExecutionContract` loading through `SAFEGUARD_CONTRACT_PATH`;
+- explicit contract source hardening: contract file must be outside the workspace and match `SAFEGUARD_CONTRACT_BLAKE3`;
 - hook-side capability, expected-file, and denied-resource enforcement for explicit contracts;
 - explicit contracts mediate native apply-patch and guarded edit paths, not arbitrary process/network execution;
 - persistent transaction lifecycle across separate `PreToolUse` and `PostToolUse` hook processes;

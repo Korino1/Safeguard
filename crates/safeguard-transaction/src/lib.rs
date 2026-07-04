@@ -1,5 +1,6 @@
 //! Internal transaction primitives for Safeguard guarded edits.
 
+use std::cell::Cell;
 use std::fmt;
 use std::fs::File;
 use std::fs::OpenOptions;
@@ -71,6 +72,7 @@ pub struct TransactionGuard {
     state_root: PathBuf,
     targets: Vec<LockedTarget>,
     lock_paths: Vec<PathBuf>,
+    record_persisted: Cell<bool>,
 }
 
 impl TransactionGuard {
@@ -92,7 +94,9 @@ impl TransactionGuard {
             started_at,
             targets: self.targets.clone(),
         };
-        write_transaction_record(&self.state_root, &self.id, &record)
+        let path = write_transaction_record(&self.state_root, &self.id, &record)?;
+        self.record_persisted.set(true);
+        Ok(path)
     }
 
     /// Persist a transaction record and leave lock files for another process to complete.
@@ -107,6 +111,14 @@ impl Drop for TransactionGuard {
     fn drop(&mut self) {
         for path in &self.lock_paths {
             let _ = std::fs::remove_file(path);
+        }
+        if !self.record_persisted.get() {
+            for target in &self.targets {
+                if let Some(path) = &target.rollback_path {
+                    let _ = std::fs::remove_file(path);
+                }
+            }
+            let _ = std::fs::remove_dir(self.state_root.join("rollback").join(self.id.as_str()));
         }
     }
 }
@@ -150,6 +162,7 @@ impl AcquisitionGuard {
             state_root,
             targets: std::mem::take(&mut self.targets),
             lock_paths: std::mem::take(&mut self.lock_paths),
+            record_persisted: Cell::new(false),
         }
     }
 }
@@ -936,6 +949,45 @@ mod tests {
             ),
             0
         );
+    }
+
+    #[test]
+    fn persist_failure_cleans_locks_and_rollback_snapshots() {
+        let fixture = Fixture::new("persist_failure_cleans_locks_and_rollback_snapshots");
+        let file = fixture.workspace.join("a.txt");
+        assert!(std::fs::write(&file, "alpha").is_ok());
+        assert!(std::fs::write(fixture.state.join("transactions"), "not a directory").is_ok());
+        let id = valid_id("tx-persist-failure");
+
+        let guard = match begin_transaction(
+            &fixture.workspace,
+            &fixture.state,
+            id.clone(),
+            &[TransactionTarget {
+                path: PathBuf::from("a.txt"),
+                expected_blake3: None,
+            }],
+        ) {
+            Ok(guard) => guard,
+            Err(err) => {
+                assert_eq!(err.to_string(), "");
+                return;
+            }
+        };
+        let lock_path = fixture
+            .state
+            .join("locks")
+            .join(format!("{}.lock", guard.targets()[0].lock_key));
+        let rollback_path = guard.targets()[0].rollback_path.clone();
+        assert!(lock_path.exists());
+        assert!(rollback_path.as_ref().is_some_and(|path| path.exists()));
+
+        let result = guard.persist_record_keep_locks();
+
+        assert!(result.is_err());
+        assert!(!lock_path.exists());
+        assert!(!rollback_path.as_ref().is_some_and(|path| path.exists()));
+        assert!(!fixture.state.join("rollback").join(id.as_str()).exists());
     }
 
     #[test]

@@ -168,6 +168,7 @@ impl VerifiedContract {
         validate_contract_schema(&contract)?;
         validate_contract_expiry(&contract)?;
         validate_contract_issuer(&contract)?;
+        validate_contract_subject(&contract)?;
         validate_contract_workspace(&contract, workspace_root.as_ref())?;
         validate_capability_constraints(&contract)?;
         validate_contract_invariants(&contract)?;
@@ -223,6 +224,8 @@ pub enum ContractValidationError {
     UnsupportedExecutableConstraint(String),
     /// Invariant is known only as a declaration and has no evaluator.
     UnsupportedInvariant(String),
+    /// Subject binding is declared but not verified by trusted runtime context.
+    UnsupportedSubjectBinding(String),
 }
 
 impl fmt::Display for ContractValidationError {
@@ -257,6 +260,9 @@ impl fmt::Display for ContractValidationError {
             }
             Self::UnsupportedInvariant(name) => {
                 write!(f, "unsupported contract invariant {name}")
+            }
+            Self::UnsupportedSubjectBinding(name) => {
+                write!(f, "unsupported contract subject binding {name}")
             }
         }
     }
@@ -296,6 +302,20 @@ fn validate_contract_issuer(contract: &ExecutionContract) -> Result<(), Contract
         "safeguard" | "cabal" => Ok(()),
         value => Err(ContractValidationError::UntrustedIssuer(value.to_string())),
     }
+}
+
+fn validate_contract_subject(contract: &ExecutionContract) -> Result<(), ContractValidationError> {
+    if contract.subject.agent_id.is_some() {
+        return Err(ContractValidationError::UnsupportedSubjectBinding(
+            "agent_id".to_string(),
+        ));
+    }
+    if contract.subject.model.is_some() {
+        return Err(ContractValidationError::UnsupportedSubjectBinding(
+            "model".to_string(),
+        ));
+    }
+    Ok(())
 }
 
 fn validate_contract_workspace(
@@ -797,6 +817,32 @@ mod tests {
             verified,
             Err(ContractValidationError::UnsupportedInvariant(
                 "no_new_unsafe".to_string()
+            ))
+        );
+    }
+
+    #[test]
+    fn verified_contract_rejects_unverified_agent_subject() {
+        let mut contract = ExecutionContract::v0_1("agent-subject");
+        contract.subject.agent_id = Some("agent-1".to_string());
+        let verified = VerifiedContract::verify(contract, ".");
+        assert_eq!(
+            verified,
+            Err(ContractValidationError::UnsupportedSubjectBinding(
+                "agent_id".to_string()
+            ))
+        );
+    }
+
+    #[test]
+    fn verified_contract_rejects_unverified_model_subject() {
+        let mut contract = ExecutionContract::v0_1("model-subject");
+        contract.subject.model = Some("gpt-5.4-mini".to_string());
+        let verified = VerifiedContract::verify(contract, ".");
+        assert_eq!(
+            verified,
+            Err(ContractValidationError::UnsupportedSubjectBinding(
+                "model".to_string()
             ))
         );
     }

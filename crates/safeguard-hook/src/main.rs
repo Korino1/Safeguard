@@ -773,9 +773,41 @@ fn load_explicit_contract(
     let path = resolve_contract_path(cwd, &value)?;
     let bytes = std::fs::read(&path)
         .with_context(|| format!("failed to read Safeguard contract {}", path.display()))?;
+    validate_explicit_contract_source(cwd, &path, &bytes)?;
     let contract = serde_json::from_slice(&bytes)
         .with_context(|| format!("failed to parse Safeguard contract {}", path.display()))?;
     Ok(Some(contract))
+}
+
+fn validate_explicit_contract_source(cwd: &str, path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
+    let expected_hash = std::env::var("SAFEGUARD_CONTRACT_BLAKE3").map_err(|_| {
+        anyhow::anyhow!("explicit contract hash is missing from trusted environment")
+    })?;
+    validate_explicit_contract_source_with_hash(cwd, path, bytes, expected_hash.trim())
+}
+
+fn validate_explicit_contract_source_with_hash(
+    cwd: &str,
+    path: &Path,
+    bytes: &[u8],
+    expected_hash: &str,
+) -> anyhow::Result<()> {
+    let workspace = PathBuf::from(cwd)
+        .canonicalize()
+        .with_context(|| format!("failed to canonicalize workspace {cwd}"))?;
+    let contract_path = path
+        .canonicalize()
+        .with_context(|| format!("failed to canonicalize contract path {}", path.display()))?;
+    if contract_path.starts_with(&workspace) {
+        anyhow::bail!("explicit contract must be stored outside the workspace");
+    }
+
+    let actual_hash = safeguard_core::blake3_hex(bytes).as_hex().to_string();
+    if !actual_hash.eq_ignore_ascii_case(expected_hash) {
+        anyhow::bail!("explicit contract hash does not match trusted environment");
+    }
+
+    Ok(())
 }
 
 fn enforce_explicit_contract(
@@ -1949,7 +1981,9 @@ mod tests {
     use super::prepare_guarded_pending;
     use super::read_pending;
     use super::run_required_validations;
+    use super::safe_file_id;
     use super::state_root;
+    use super::validate_explicit_contract_source_with_hash;
     use super::write_execution_receipt;
     use super::write_pending;
 
@@ -2847,6 +2881,74 @@ PATCH"#;
         let enforced =
             enforce_explicit_contract(root, "Bash", "bash_apply_patch", &files, contract);
         assert!(enforced.is_err());
+    }
+
+    #[test]
+    fn explicit_contract_source_rejects_workspace_path() {
+        let fixture = Fixture::new("explicit_contract_source_rejects_workspace_path");
+        let contract_path = fixture.root.join("contract.json");
+        let bytes = br#"{"schema_version":"0.1"}"#;
+        assert!(std::fs::write(&contract_path, bytes).is_ok());
+        let Some(root) = fixture.root.to_str() else {
+            assert_eq!(fixture.root.display().to_string(), "");
+            return;
+        };
+        let hash = safeguard_core::blake3_hex(bytes).as_hex().to_string();
+
+        let result =
+            validate_explicit_contract_source_with_hash(root, &contract_path, bytes, &hash);
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn explicit_contract_source_requires_matching_trusted_hash() {
+        let fixture = Fixture::new("explicit_contract_source_requires_matching_trusted_hash");
+        let Some(root) = fixture.root.to_str() else {
+            assert_eq!(fixture.root.display().to_string(), "");
+            return;
+        };
+        let outside_dir = fixture
+            .root
+            .parent()
+            .unwrap_or(&fixture.root)
+            .join(format!("{}-contract", safe_file_id(root)));
+        assert!(std::fs::create_dir_all(&outside_dir).is_ok());
+        let contract_path = outside_dir.join("contract.json");
+        let bytes = br#"{"schema_version":"0.1"}"#;
+        assert!(std::fs::write(&contract_path, bytes).is_ok());
+
+        let result =
+            validate_explicit_contract_source_with_hash(root, &contract_path, bytes, "bad-hash");
+
+        assert!(result.is_err());
+        let _ = std::fs::remove_dir_all(outside_dir);
+    }
+
+    #[test]
+    fn explicit_contract_source_accepts_outside_path_with_matching_hash() {
+        let fixture =
+            Fixture::new("explicit_contract_source_accepts_outside_path_with_matching_hash");
+        let Some(root) = fixture.root.to_str() else {
+            assert_eq!(fixture.root.display().to_string(), "");
+            return;
+        };
+        let outside_dir = fixture
+            .root
+            .parent()
+            .unwrap_or(&fixture.root)
+            .join(format!("{}-contract", safe_file_id(root)));
+        assert!(std::fs::create_dir_all(&outside_dir).is_ok());
+        let contract_path = outside_dir.join("contract.json");
+        let bytes = br#"{"schema_version":"0.1"}"#;
+        assert!(std::fs::write(&contract_path, bytes).is_ok());
+        let hash = safeguard_core::blake3_hex(bytes).as_hex().to_string();
+
+        let result =
+            validate_explicit_contract_source_with_hash(root, &contract_path, bytes, &hash);
+
+        assert!(result.is_ok());
+        let _ = std::fs::remove_dir_all(outside_dir);
     }
 
     #[test]
