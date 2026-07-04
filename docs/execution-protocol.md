@@ -175,7 +175,7 @@ memoryx_evidence:
 Implemented now:
 
 - transparent plugin hook layer;
-- short MCP fallback tools;
+- short MCP fallback tools backed by the same transaction engine for `sg_apply`;
 - internal audit JSONL;
 - initial transaction crate with locks, digest CAS, rollback snapshots, recovery candidate scan, and `ExecutionContract` target mapping;
 - hook-side implicit `ExecutionContract` binding for native `apply_patch`;

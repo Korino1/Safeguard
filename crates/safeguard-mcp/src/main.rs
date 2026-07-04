@@ -286,7 +286,7 @@ fn tools_call_response(id: Value, request: &Value) -> Value {
             };
 
             match safeguard_core::plan_text_file_replacement(&path, &args.old, &args.new) {
-                Ok(plan) => match safeguard_core::apply_text_file_replacement(&plan) {
+                Ok(plan) => match apply_transactional_replacement(&plan) {
                     Ok(()) => match append_audit_record("sg_apply", &plan) {
                         Ok(()) => replacement_plan_result(id, "applied", &plan),
                         Err(err) => tool_text(id, format!("applied; audit write failed: {err}")),
@@ -427,6 +427,65 @@ fn replacement_plan_result(
             "isError": false
         }
     })
+}
+
+fn apply_transactional_replacement(
+    plan: &safeguard_core::FileReplacementPlan,
+) -> anyhow::Result<()> {
+    let workspace_root = workspace_root()?;
+    let state_root = state_root();
+    let transaction_id =
+        safeguard_transaction::TransactionId::new(format!("mcp-{}", current_unix_nanos()))?;
+    let targets = [safeguard_transaction::TransactionTarget {
+        path: plan.path.clone(),
+        expected_blake3: Some(plan.before_blake3.as_hex().to_string()),
+    }];
+    let guard = safeguard_transaction::begin_transaction(
+        &workspace_root,
+        &state_root,
+        transaction_id.clone(),
+        &targets,
+    )?;
+    guard.persist_record()?;
+
+    if let Err(err) = safeguard_core::apply_text_file_replacement(plan) {
+        let _ = safeguard_transaction::rollback_transaction(&state_root, &transaction_id);
+        anyhow::bail!("{err}");
+    }
+
+    let after = std::fs::read(&plan.path)
+        .map(|bytes| safeguard_core::blake3_hex(&bytes).as_hex().to_string())
+        .with_context(|| format!("failed to verify {}", plan.path.display()))?;
+    if after != plan.after_blake3.as_hex() {
+        let _ = safeguard_transaction::rollback_transaction(&state_root, &transaction_id);
+        anyhow::bail!("replacement result did not match planned output");
+    }
+
+    safeguard_transaction::complete_transaction(&state_root, &transaction_id)?;
+    Ok(())
+}
+
+fn workspace_root() -> anyhow::Result<PathBuf> {
+    let cwd = std::env::current_dir().context("failed to resolve current directory")?;
+    match std::env::var_os("SAFEGUARD_WORKSPACE_ROOT") {
+        Some(root) => PathBuf::from(root)
+            .canonicalize()
+            .with_context(|| "failed to canonicalize workspace root"),
+        None => Ok(cwd),
+    }
+}
+
+fn state_root() -> PathBuf {
+    std::env::current_dir()
+        .unwrap_or_else(|_| PathBuf::from("."))
+        .join(".safeguard")
+}
+
+fn current_unix_nanos() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default()
 }
 
 fn append_audit_record(
