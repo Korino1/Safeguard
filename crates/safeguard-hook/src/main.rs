@@ -59,6 +59,8 @@ struct PendingEdit {
     transaction_record_path: String,
     #[serde(default)]
     contract_hash: Option<String>,
+    #[serde(default)]
+    required_validations: Vec<String>,
     files: Vec<PendingFile>,
 }
 
@@ -79,6 +81,7 @@ struct ReceiptOutcome {
     status: safeguard_protocol::ReceiptStatus,
     tool_success: bool,
     expected_result_verified: bool,
+    validations_passed: bool,
     rollback_completed: Option<bool>,
     completion_error: Option<String>,
 }
@@ -328,7 +331,9 @@ fn post_tool_use(request: &HookRequest) -> Value {
         });
     }
     let started_at = transaction_started_at(&pending).unwrap_or_else(current_unix_timestamp);
-    let accepted = success && expected_result_verified;
+    let (validations, validations_passed) =
+        run_required_validations(&pending, success && expected_result_verified);
+    let accepted = success && expected_result_verified && validations_passed;
     let mut receipt_status = if accepted {
         safeguard_protocol::ReceiptStatus::Accepted
     } else {
@@ -379,11 +384,13 @@ fn post_tool_use(request: &HookRequest) -> Value {
             status: receipt_status.clone(),
             tool_success: success,
             expected_result_verified,
+            validations_passed,
             rollback_completed,
             completion_error: completion_error.clone(),
         },
         started_at,
         changed_files,
+        validations,
     );
 
     let _ = append_policy_audit(
@@ -397,6 +404,7 @@ fn post_tool_use(request: &HookRequest) -> Value {
             "transaction_id": pending.transaction_id,
             "success": success,
             "verified": expected_result_verified,
+            "validations_passed": validations_passed,
             "receipt_status": format!("{:?}", receipt_status),
             "completion_error": completion_error,
             "files": files
@@ -493,6 +501,11 @@ fn prepare_guarded_pending(
         cwd: cwd.to_string(),
         command_kind: command_kind.to_string(),
         contract_hash: contract_hash(&contract),
+        required_validations: contract
+            .required_validations
+            .iter()
+            .map(|validation| validation.command.clone())
+            .collect(),
         contract_id,
         transaction_id: transaction_id.as_str().to_string(),
         transaction_record_path: record_path.display().to_string(),
@@ -703,11 +716,66 @@ fn transaction_started_at(pending: &PendingEdit) -> Option<u64> {
         .map(|record| record.started_at)
 }
 
+fn run_required_validations(
+    pending: &PendingEdit,
+    should_run: bool,
+) -> (Vec<safeguard_protocol::ValidationResult>, bool) {
+    let mut all_passed = true;
+    let results = pending
+        .required_validations
+        .iter()
+        .map(|command| {
+            let status = if should_run {
+                match run_validation_command(&pending.cwd, command) {
+                    Ok(true) => safeguard_protocol::ValidationStatus::Passed,
+                    Ok(false) | Err(_) => {
+                        all_passed = false;
+                        safeguard_protocol::ValidationStatus::Failed
+                    }
+                }
+            } else {
+                all_passed = false;
+                safeguard_protocol::ValidationStatus::NotRun
+            };
+            safeguard_protocol::ValidationResult {
+                command: command.clone(),
+                status,
+            }
+        })
+        .collect::<Vec<_>>();
+    (results, all_passed)
+}
+
+fn run_validation_command(cwd: &str, command: &str) -> anyhow::Result<bool> {
+    let status = validation_shell_command(command)
+        .current_dir(cwd)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .with_context(|| format!("failed to run validation command: {command}"))?;
+    Ok(status.success())
+}
+
+#[cfg(windows)]
+fn validation_shell_command(command: &str) -> std::process::Command {
+    let mut process = std::process::Command::new("powershell");
+    process.args(["-NoProfile", "-Command", command]);
+    process
+}
+
+#[cfg(not(windows))]
+fn validation_shell_command(command: &str) -> std::process::Command {
+    let mut process = std::process::Command::new("sh");
+    process.args(["-c", command]);
+    process
+}
+
 fn write_execution_receipt(
     pending: &PendingEdit,
     outcome: ReceiptOutcome,
     started_at: u64,
     changed_files: Vec<safeguard_protocol::ChangedFile>,
+    validations: Vec<safeguard_protocol::ValidationResult>,
 ) -> anyhow::Result<PathBuf> {
     let receipt_id = format!("receipt-{}", safe_file_id(&pending.tool_use_id));
     let mut invariants = vec![
@@ -722,6 +790,14 @@ fn write_execution_receipt(
         safeguard_protocol::InvariantResult {
             name: "expected_result".to_string(),
             status: if outcome.expected_result_verified {
+                safeguard_protocol::InvariantStatus::Passed
+            } else {
+                safeguard_protocol::InvariantStatus::Failed
+            },
+        },
+        safeguard_protocol::InvariantResult {
+            name: "required_validations".to_string(),
+            status: if outcome.validations_passed {
                 safeguard_protocol::InvariantStatus::Passed
             } else {
                 safeguard_protocol::InvariantStatus::Failed
@@ -768,7 +844,7 @@ fn write_execution_receipt(
             })
             .collect(),
         changed_files,
-        validations: Vec::new(),
+        validations,
         policy_violations,
         invariants,
         receipt_hash: None,
@@ -1331,6 +1407,7 @@ mod tests {
     use super::plan_patch_files;
     use super::prepare_guarded_pending;
     use super::read_pending;
+    use super::run_required_validations;
     use super::state_root;
     use super::write_execution_receipt;
     use super::write_pending;
@@ -1402,10 +1479,12 @@ PATCH"#;
                 status: safeguard_protocol::ReceiptStatus::Accepted,
                 tool_success: true,
                 expected_result_verified: true,
+                validations_passed: true,
                 rollback_completed: None,
                 completion_error: None,
             },
             1,
+            Vec::new(),
             Vec::new(),
         );
         assert!(receipt_path.as_ref().is_ok_and(|path| path.exists()));
@@ -1419,10 +1498,12 @@ PATCH"#;
                 status: safeguard_protocol::ReceiptStatus::Accepted,
                 tool_success: true,
                 expected_result_verified: true,
+                validations_passed: true,
                 rollback_completed: None,
                 completion_error: None,
             },
             1,
+            Vec::new(),
             Vec::new(),
         );
         let previous_hash = second_receipt_path
@@ -1661,6 +1742,36 @@ PATCH"#;
                 .and_then(|mut files| files.pop())
                 .and_then(|file| file.expected_after_blake3),
             Some(expected)
+        );
+    }
+
+    #[test]
+    fn failed_required_validation_is_not_accepted() {
+        let fixture = Fixture::new("failed_required_validation_is_not_accepted");
+        let Some(root) = fixture.root.to_str() else {
+            assert_eq!(fixture.root.display().to_string(), "");
+            return;
+        };
+        let pending = super::PendingEdit {
+            tool_use_id: "validation-fail".to_string(),
+            tool_name: "Bash".to_string(),
+            cwd: root.to_string(),
+            command_kind: "bash_apply_patch".to_string(),
+            contract_id: "validation-fail".to_string(),
+            transaction_id: "validation-fail".to_string(),
+            transaction_record_path: String::new(),
+            contract_hash: None,
+            required_validations: vec!["this-command-should-not-exist-safeguard".to_string()],
+            files: Vec::new(),
+        };
+
+        let (validations, passed) = run_required_validations(&pending, true);
+
+        assert!(!passed);
+        assert_eq!(validations.len(), 1);
+        assert_eq!(
+            validations[0].status,
+            safeguard_protocol::ValidationStatus::Failed
         );
     }
 
