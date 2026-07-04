@@ -4,8 +4,6 @@ use std::io::BufRead;
 use std::io::Write;
 use std::path::Path;
 use std::path::PathBuf;
-use std::time::SystemTime;
-use std::time::UNIX_EPOCH;
 
 use anyhow::Context;
 use serde_json::Value;
@@ -272,32 +270,11 @@ fn tools_call_response(id: Value, request: &Value) -> Value {
                 Err(err) => tool_error_text(id, format!("rejected: {err}")),
             }
         }
-        "sg_apply" => {
-            let Some(args) = file_replace_args(id.clone(), arguments) else {
-                return invalid_params(
-                    id,
-                    "file replacement requires string arguments 'path', 'old', and 'new'",
-                );
-            };
-
-            let path = match resolve_allowed_path(&args.path) {
-                Ok(path) => path,
-                Err(err) => return tool_error_text(id, format!("rejected: {err}")),
-            };
-
-            match safeguard_core::plan_text_file_replacement(&path, &args.old, &args.new) {
-                Ok(plan) => match apply_transactional_replacement(&plan) {
-                    Ok(()) => match append_audit_record("sg_apply", &plan) {
-                        Ok(()) => replacement_plan_result(id, "applied", &plan),
-                        Err(err) => {
-                            tool_error_text(id, format!("applied; audit write failed: {err}"))
-                        }
-                    },
-                    Err(err) => tool_error_text(id, format!("rejected: {err}")),
-                },
-                Err(err) => tool_error_text(id, format!("rejected: {err}")),
-            }
-        }
+        "sg_apply" => tool_error_text(
+            id,
+            "rejected: sg_apply is disabled in transparent mode; use native Codex edits"
+                .to_string(),
+        ),
         "sg_audit" => {
             let limit = arguments
                 .get("limit")
@@ -453,107 +430,6 @@ fn replacement_plan_result(
     })
 }
 
-fn apply_transactional_replacement(
-    plan: &safeguard_core::FileReplacementPlan,
-) -> anyhow::Result<()> {
-    let workspace_root = workspace_root()?;
-    let state_root = state_root();
-    let transaction_id =
-        safeguard_transaction::TransactionId::new(format!("mcp-{}", current_unix_nanos()))?;
-    let targets = [safeguard_transaction::TransactionTarget {
-        path: plan.path.clone(),
-        expected_blake3: Some(plan.before_blake3.as_hex().to_string()),
-    }];
-    let guard = safeguard_transaction::begin_transaction(
-        &workspace_root,
-        &state_root,
-        transaction_id.clone(),
-        &targets,
-    )?;
-    guard.persist_record()?;
-
-    if let Err(err) = safeguard_core::apply_text_file_replacement(plan) {
-        let _ = safeguard_transaction::rollback_transaction(&state_root, &transaction_id);
-        anyhow::bail!("{err}");
-    }
-
-    match verify_replacement_result(plan) {
-        Ok(()) => {
-            safeguard_transaction::complete_transaction(&state_root, &transaction_id)?;
-            Ok(())
-        }
-        Err(err) => {
-            let _ = safeguard_transaction::rollback_transaction(&state_root, &transaction_id);
-            Err(err)
-        }
-    }
-}
-
-fn verify_replacement_result(plan: &safeguard_core::FileReplacementPlan) -> anyhow::Result<()> {
-    let after = std::fs::read(&plan.path)
-        .map(|bytes| safeguard_core::blake3_hex(&bytes).as_hex().to_string())
-        .with_context(|| format!("failed to verify {}", plan.path.display()))?;
-    if after != plan.after_blake3.as_hex() {
-        anyhow::bail!("replacement result did not match planned output");
-    }
-    Ok(())
-}
-
-fn workspace_root() -> anyhow::Result<PathBuf> {
-    let cwd = std::env::current_dir().context("failed to resolve current directory")?;
-    match std::env::var_os("SAFEGUARD_WORKSPACE_ROOT") {
-        Some(root) => PathBuf::from(root)
-            .canonicalize()
-            .with_context(|| "failed to canonicalize workspace root"),
-        None => Ok(cwd),
-    }
-}
-
-fn state_root() -> PathBuf {
-    std::env::current_dir()
-        .unwrap_or_else(|_| PathBuf::from("."))
-        .join(".safeguard")
-}
-
-fn current_unix_nanos() -> u128 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_nanos())
-        .unwrap_or_default()
-}
-
-fn append_audit_record(
-    operation: &str,
-    plan: &safeguard_core::FileReplacementPlan,
-) -> anyhow::Result<()> {
-    let audit_dir = Path::new(".safeguard");
-    std::fs::create_dir_all(audit_dir).context("failed to create audit directory")?;
-    let audit_path = audit_dir.join("audit.jsonl");
-    let timestamp = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .context("system time is before unix epoch")?
-        .as_secs();
-    let record = json!({
-        "ts_unix": timestamp,
-        "operation": operation,
-        "path": plan.path.display().to_string(),
-        "start": plan.replacement.start,
-        "end": plan.replacement.end,
-        "removed_bytes": plan.replacement.removed_bytes,
-        "inserted_bytes": plan.replacement.inserted_bytes,
-        "before_blake3": plan.before_blake3.as_hex(),
-        "after_blake3": plan.after_blake3.as_hex()
-    });
-
-    let mut file = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&audit_path)
-        .context("failed to open audit jsonl")?;
-    writeln!(file, "{record}").context("failed to append audit jsonl")?;
-    Ok(())
-}
-
 fn read_audit_summary(limit: usize) -> anyhow::Result<Value> {
     let audit_path = Path::new(".safeguard").join("audit.jsonl");
     if !audit_path.exists() {
@@ -623,8 +499,8 @@ mod tests {
     }
 
     #[test]
-    fn apply_file_replacement_hides_hashes_from_response() {
-        let path = test_path("apply_file_replacement_hides_hashes_from_response.txt");
+    fn apply_file_replacement_rejects_in_transparent_mode() {
+        let path = test_path("apply_file_replacement_rejects_in_transparent_mode.txt");
         let write_result = std::fs::write(&path, "alpha beta gamma");
         assert!(write_result.is_ok());
 
@@ -634,35 +510,15 @@ mod tests {
         );
         let response = handle_line(&request).unwrap_or_default();
 
-        assert!(response.contains(r#"\"status\":\"applied\""#));
+        assert_tool_result_is_error(&response, "sg_apply is disabled in transparent mode");
         assert!(!response.to_lowercase().contains("blake3"));
-
-        let output = match std::fs::read_to_string(&path) {
-            Ok(output) => output,
-            Err(err) => {
-                assert_eq!(err.to_string(), "");
-                let _ = std::fs::remove_file(&path);
-                return;
-            }
-        };
-        assert_eq!(output, "alpha BETA gamma");
+        assert!(std::fs::read_to_string(&path).is_ok_and(|value| value == "alpha beta gamma"));
 
         let _ = std::fs::remove_file(&path);
     }
 
     #[test]
     fn audit_summary_omits_internal_digest_fields() {
-        let path = test_path("audit_summary_omits_internal_digest_fields.txt");
-        let write_result = std::fs::write(&path, "alpha beta gamma");
-        assert!(write_result.is_ok());
-
-        let request = format!(
-            r#"{{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{{"name":"sg_apply","arguments":{{"path":{},"old":"beta","new":"BETA"}}}}}}"#,
-            serde_json::json!(path.display().to_string())
-        );
-        let apply_response = handle_line(&request).unwrap_or_default();
-        assert!(apply_response.contains(r#"\"status\":\"applied\""#));
-
         let summary_response = handle_line(
             r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"sg_audit","arguments":{"limit":1}}}"#,
         )
@@ -670,8 +526,6 @@ mod tests {
 
         assert!(summary_response.contains(r#"\"total_records\":"#));
         assert!(!summary_response.to_lowercase().contains("blake3"));
-
-        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
@@ -688,7 +542,7 @@ mod tests {
         let response = handle_line(&request).unwrap_or_default();
 
         assert!(response.contains("rejected"));
-        assert_tool_result_is_error(&response, "rejected:");
+        assert_tool_result_is_error(&response, "sg_apply is disabled in transparent mode");
         assert!(std::fs::read_to_string(&path).is_ok_and(|value| value == "alpha"));
         let _ = std::fs::remove_file(&path);
     }

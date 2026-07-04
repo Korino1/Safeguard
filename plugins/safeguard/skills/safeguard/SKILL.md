@@ -22,7 +22,7 @@ Expected MCP tools:
 - `sg_ping`
 - `sg_plan`
 - `sg_dry`
-- `sg_apply`
+- `sg_apply` returns a refusal in transparent mode and must not be used as the ordinary write path
 - `sg_audit`
 
 Internal integrity metadata is wrapper state. Do not ask the model to reason over hashes or include digests in normal prompts.

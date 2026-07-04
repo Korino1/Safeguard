@@ -85,14 +85,14 @@ Optional execution contract:
 - `sg_ping` - connectivity check.
 - `sg_plan` - plans a unique in-memory text replacement.
 - `sg_dry` - plans a guarded file replacement without writing.
-- `sg_apply` - applies a guarded file replacement.
+- `sg_apply` - disabled in transparent mode; native Codex edits are the write path.
 - `sg_audit` - returns recent audit records without internal digest fields.
 
 ## Human Usage Pattern
 
 Use Codex normally. Safeguard protects native edit paths through plugin hooks.
 
-Use `sg_dry` and `sg_apply` only when you explicitly want the MCP fallback/API for a deterministic text replacement. The tool rejects missing, empty, or ambiguous fragments.
+Use `sg_dry` only for explicit planning/debugging of deterministic text replacements. `sg_apply` remains listed for protocol compatibility, but returns a short refusal in transparent mode so models cannot bypass lifecycle hooks through MCP.
 
 Audit records are stored locally in `.safeguard/audit.jsonl`. Execution receipts are stored locally in `.safeguard/receipts/`. MemoryX-shaped evidence summaries are stored locally in `.safeguard/evidence/`. These files are ignored by git.
 
@@ -117,7 +117,7 @@ Agent rules:
 - Do not include internal hash metadata in prompts or normal summaries.
 - Treat hash/integrity checks as wrapper state owned by Safeguard hooks and MCP server.
 - Use native `apply_patch` for ordinary file edits.
-- Use `sg_dry` before `sg_apply` only when the explicit MCP fallback/API is needed.
+- Use `sg_dry` only when explicit MCP planning/debugging is needed.
 - If a replacement is rejected as ambiguous, narrow the old fragment with more surrounding context.
 - If a path is rejected as outside workspace root, do not bypass Safeguard with arbitrary shell writes unless the user explicitly asks for that path and understands the policy boundary.
 - Use `sg_audit` for operation visibility; it intentionally omits digest fields.

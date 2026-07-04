@@ -1908,6 +1908,23 @@ fn is_risky_shell_write(command: &str) -> bool {
         "cp ",
         "tee ",
         "cat >",
+        "[system.io.file]::writealltext",
+        "[system.io.file]::writealllines",
+        "[system.io.file]::writeallbytes",
+        "[io.file]::writealltext",
+        "[io.file]::writealllines",
+        "[io.file]::writeallbytes",
+        "::writealltext",
+        "::writealllines",
+        "::writeallbytes",
+        "::appendalltext",
+        "::appendalllines",
+        "::delete(",
+        "::move(",
+        "::copy(",
+        ".writealltext(",
+        ".writealllines(",
+        ".writeallbytes(",
     ];
     write_words.iter().any(|word| lower.contains(word))
         || lower.contains(" > ")
@@ -2031,6 +2048,12 @@ PATCH"#,
     fn detects_shell_writes() {
         assert!(is_risky_shell_write("Set-Content file.txt value"));
         assert!(is_risky_shell_write("cat > file.txt"));
+        assert!(is_risky_shell_write(
+            "[System.IO.File]::WriteAllText($path, $newText)"
+        ));
+        assert!(is_risky_shell_write(
+            "[System.IO.File]::WriteAllLines($path, $lines)"
+        ));
         assert!(!is_risky_shell_write("cargo test --workspace"));
     }
 
