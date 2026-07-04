@@ -68,6 +68,10 @@ struct PendingFile {
     operation: String,
     existed_before: bool,
     before_blake3: Option<String>,
+    #[serde(default)]
+    expected_after_blake3: Option<String>,
+    #[serde(default)]
+    patch_blake3: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -320,7 +324,7 @@ fn post_tool_use(request: &HookRequest) -> Value {
             operation: protocol_file_operation(&file.operation),
             before_digest: file.before_blake3.clone(),
             after_digest: after_blake3,
-            diff_digest: None,
+            diff_digest: file.patch_blake3.clone(),
         });
     }
     let started_at = transaction_started_at(&pending).unwrap_or_else(current_unix_timestamp);
@@ -519,7 +523,7 @@ fn implicit_contract(
             path: file.path.clone(),
             operation: protocol_file_operation(&file.operation),
             before_digest: file.before_blake3.clone(),
-            expected_diff_digest: None,
+            expected_diff_digest: file.patch_blake3.clone(),
         })
         .collect();
     contract
@@ -851,6 +855,12 @@ fn expected_result_matches(
     exists_after: bool,
     after_blake3: Option<&str>,
 ) -> bool {
+    if file.operation == "delete" {
+        return file.existed_before && !exists_after && file.expected_after_blake3.is_none();
+    }
+    if let Some(expected_after) = file.expected_after_blake3.as_deref() {
+        return exists_after && after_blake3 == Some(expected_after);
+    }
     match file.operation.as_str() {
         "add" => !file.existed_before && exists_after && after_blake3.is_some(),
         "delete" => file.existed_before && !exists_after,
@@ -1015,11 +1025,16 @@ fn plan_patch_files(cwd: &str, command: &str) -> anyhow::Result<Vec<PendingFile>
         } else {
             None
         };
+        let expected_after_blake3 =
+            expected_after_digest_for_patch(&resolved, patch, &path, &operation)?;
+        let patch_blake3 = file_patch_digest(patch, &path);
         files.push(PendingFile {
             path: resolved.display().to_string(),
             operation,
             existed_before,
             before_blake3,
+            expected_after_blake3,
+            patch_blake3,
         });
     }
 
@@ -1049,6 +1064,138 @@ fn patch_targets(patch: &str) -> Vec<(String, String)> {
         }
     }
     targets
+}
+
+fn expected_after_digest_for_patch(
+    resolved: &Path,
+    patch: &str,
+    patch_path: &str,
+    operation: &str,
+) -> anyhow::Result<Option<String>> {
+    if operation == "delete" {
+        return Ok(None);
+    }
+    let section = file_patch_section(patch, patch_path)
+        .with_context(|| format!("missing patch body for {patch_path}"))?;
+    let expected = match operation {
+        "add" => added_file_content(&section)?,
+        _ => {
+            let original = std::fs::read_to_string(resolved)
+                .with_context(|| format!("failed to read patch target {}", resolved.display()))?;
+            updated_file_content(&original, &section)?
+        }
+    };
+    Ok(Some(
+        safeguard_core::blake3_hex(expected.as_bytes())
+            .as_hex()
+            .to_string(),
+    ))
+}
+
+fn file_patch_digest(patch: &str, patch_path: &str) -> Option<String> {
+    file_patch_section(patch, patch_path).map(|section| {
+        safeguard_core::blake3_hex(section.join("\n").as_bytes())
+            .as_hex()
+            .to_string()
+    })
+}
+
+fn file_patch_section(patch: &str, patch_path: &str) -> Option<Vec<String>> {
+    let mut collecting = false;
+    let mut lines = Vec::new();
+    for line in patch.lines() {
+        let starts_file = line.starts_with("*** Add File: ")
+            || line.starts_with("*** Update File: ")
+            || line.starts_with("*** Delete File: ");
+        if starts_file {
+            if collecting {
+                break;
+            }
+            let matched = line
+                .strip_prefix("*** Add File: ")
+                .or_else(|| line.strip_prefix("*** Update File: "))
+                .or_else(|| line.strip_prefix("*** Delete File: "))
+                .is_some_and(|path| path.trim() == patch_path);
+            collecting = matched;
+            continue;
+        }
+        if collecting && line.starts_with("*** End Patch") {
+            break;
+        }
+        if collecting {
+            lines.push(line.to_string());
+        }
+    }
+    collecting.then_some(lines)
+}
+
+fn added_file_content(section: &[String]) -> anyhow::Result<String> {
+    let mut lines = Vec::new();
+    for line in section {
+        if line.starts_with("@@") {
+            continue;
+        }
+        let Some(content) = line.strip_prefix('+') else {
+            anyhow::bail!("add file patch contains a non-added line");
+        };
+        lines.push(content.to_string());
+    }
+    Ok(join_patch_lines(lines, true))
+}
+
+fn updated_file_content(original: &str, section: &[String]) -> anyhow::Result<String> {
+    let (original_lines, trailing_newline) = split_patch_text(original);
+    let mut output = Vec::new();
+    let mut index = 0usize;
+    for line in section {
+        if line.starts_with("@@") {
+            continue;
+        }
+        if let Some(expected) = line.strip_prefix(' ') {
+            let Some(actual) = original_lines.get(index) else {
+                anyhow::bail!("patch context exceeds original file");
+            };
+            if actual != expected {
+                anyhow::bail!("patch context does not match original file");
+            }
+            output.push(actual.clone());
+            index += 1;
+        } else if let Some(expected) = line.strip_prefix('-') {
+            let Some(actual) = original_lines.get(index) else {
+                anyhow::bail!("patch removal exceeds original file");
+            };
+            if actual != expected {
+                anyhow::bail!("patch removal does not match original file");
+            }
+            index += 1;
+        } else if let Some(added) = line.strip_prefix('+') {
+            output.push(added.to_string());
+        }
+    }
+    output.extend(original_lines.into_iter().skip(index));
+    Ok(join_patch_lines(output, trailing_newline))
+}
+
+fn split_patch_text(value: &str) -> (Vec<String>, bool) {
+    let trailing_newline = value.ends_with('\n');
+    let lines = if value.is_empty() {
+        Vec::new()
+    } else {
+        value
+            .trim_end_matches('\n')
+            .split('\n')
+            .map(|line| line.trim_end_matches('\r').to_string())
+            .collect()
+    };
+    (lines, trailing_newline)
+}
+
+fn join_patch_lines(lines: Vec<String>, trailing_newline: bool) -> String {
+    let mut value = lines.join("\n");
+    if trailing_newline && !value.is_empty() {
+        value.push('\n');
+    }
+    value
 }
 
 fn resolve_patch_path(cwd: &Path, patch_path: &str) -> anyhow::Result<PathBuf> {
@@ -1445,6 +1592,8 @@ PATCH"#;
             operation: "update".to_string(),
             existed_before: true,
             before_blake3: None,
+            expected_after_blake3: None,
+            patch_blake3: None,
         }];
         let contract = implicit_contract(root, "contract-ok", "Bash", "bash_apply_patch", &files);
         let enforced =
@@ -1468,18 +1617,51 @@ PATCH"#;
             operation: "update".to_string(),
             existed_before: true,
             before_blake3: None,
+            expected_after_blake3: None,
+            patch_blake3: None,
         }];
         let attempted = vec![super::PendingFile {
             path: other.display().to_string(),
             operation: "update".to_string(),
             existed_before: true,
             before_blake3: None,
+            expected_after_blake3: None,
+            patch_blake3: None,
         }];
         let contract =
             implicit_contract(root, "contract-deny", "Bash", "bash_apply_patch", &declared);
         let enforced =
             enforce_explicit_contract(root, "Bash", "bash_apply_patch", &attempted, contract);
         assert!(enforced.is_err());
+    }
+
+    #[test]
+    fn plans_expected_after_digest_for_update_patch() {
+        let fixture = Fixture::new("plans_expected_after_digest_for_update_patch");
+        let file = fixture.root.join("a.txt");
+        assert!(std::fs::write(&file, "alpha").is_ok());
+        let Some(root) = fixture.root.to_str() else {
+            assert_eq!(fixture.root.display().to_string(), "");
+            return;
+        };
+        let command = r#"apply_patch <<'PATCH'
+*** Begin Patch
+*** Update File: a.txt
+@@
+-alpha
++beta
+*** End Patch
+PATCH"#;
+        let files = plan_patch_files(root, command);
+        assert!(files.as_ref().is_ok_and(|files| files.len() == 1));
+        let expected = safeguard_core::blake3_hex(b"beta").as_hex().to_string();
+        assert_eq!(
+            files
+                .ok()
+                .and_then(|mut files| files.pop())
+                .and_then(|file| file.expected_after_blake3),
+            Some(expected)
+        );
     }
 
     #[test]
@@ -1496,6 +1678,8 @@ PATCH"#;
             operation: "update".to_string(),
             existed_before: true,
             before_blake3: None,
+            expected_after_blake3: None,
+            patch_blake3: None,
         }];
         let mut contract = safeguard_protocol::ExecutionContract::v0_1("docs-style");
         contract.capabilities.push(safeguard_protocol::Capability {
@@ -1526,6 +1710,8 @@ PATCH"#;
             operation: "update".to_string(),
             existed_before: true,
             before_blake3: Some("old".to_string()),
+            expected_after_blake3: Some("new".to_string()),
+            patch_blake3: None,
         };
         assert!(expected_result_matches(&modified, true, Some("new")));
         assert!(!expected_result_matches(&modified, true, Some("old")));
@@ -1535,6 +1721,8 @@ PATCH"#;
             operation: "add".to_string(),
             existed_before: false,
             before_blake3: None,
+            expected_after_blake3: None,
+            patch_blake3: None,
         };
         assert!(expected_result_matches(&added, true, Some("new")));
         assert!(!expected_result_matches(&added, false, None));
@@ -1544,6 +1732,8 @@ PATCH"#;
             operation: "delete".to_string(),
             existed_before: true,
             before_blake3: Some("old".to_string()),
+            expected_after_blake3: None,
+            patch_blake3: None,
         };
         assert!(expected_result_matches(&deleted, false, None));
         assert!(!expected_result_matches(&deleted, true, Some("old")));

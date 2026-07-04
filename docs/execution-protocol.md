@@ -184,6 +184,8 @@ Implemented now:
 - persistent transaction lifecycle across separate `PreToolUse` and `PostToolUse` hook processes;
 - hook-side `ExecutionReceipt v0.1` emission for guarded native edits;
 - receipt-level expected add/modify/delete result verification;
+- exact expected after-content digest verification for standard `apply_patch` edits;
+- patch section digest recorded as `diff_digest` / `expected_diff_digest` evidence for native patch edits;
 - local receipt hash-chain continuity through `previous_receipt_hash`;
 - local MemoryX-shaped evidence summary export from contract and receipt hashes;
 - explicit recovery CLI for listing interrupted transactions and rolling them back with recovery receipts.
