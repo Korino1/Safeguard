@@ -1678,8 +1678,14 @@ fn expected_after_digest_for_patch(
     let expected = match operation {
         "add" => added_file_content(&section)?,
         _ => {
-            let original = std::fs::read_to_string(resolved)
+            let original_bytes = std::fs::read(resolved)
                 .with_context(|| format!("failed to read patch target {}", resolved.display()))?;
+            if has_mixed_line_endings(&original_bytes) {
+                return Ok(None);
+            }
+            let original = String::from_utf8(original_bytes).with_context(|| {
+                format!("patch target is not valid UTF-8: {}", resolved.display())
+            })?;
             updated_file_content(&original, &section)?
         }
     };
@@ -1688,6 +1694,25 @@ fn expected_after_digest_for_patch(
             .as_hex()
             .to_string(),
     ))
+}
+
+fn has_mixed_line_endings(bytes: &[u8]) -> bool {
+    let mut saw_lf = false;
+    let mut saw_crlf = false;
+    for (index, byte) in bytes.iter().enumerate() {
+        if *byte != b'\n' {
+            continue;
+        }
+        if index > 0 && bytes[index - 1] == b'\r' {
+            saw_crlf = true;
+        } else {
+            saw_lf = true;
+        }
+        if saw_lf && saw_crlf {
+            return true;
+        }
+    }
+    false
 }
 
 fn file_patch_digest(patch: &str, patch_path: &str) -> Option<String> {
@@ -1738,11 +1763,11 @@ fn added_file_content(section: &[String]) -> anyhow::Result<String> {
         };
         lines.push(content.to_string());
     }
-    Ok(join_patch_lines(lines, true))
+    Ok(join_patch_lines(lines, true, "\n"))
 }
 
 fn updated_file_content(original: &str, section: &[String]) -> anyhow::Result<String> {
-    let (original_lines, trailing_newline) = split_patch_text(original);
+    let (original_lines, trailing_newline, line_ending) = split_patch_text(original);
     let mut output = Vec::new();
     let mut index = 0usize;
     for hunk in update_hunks(section) {
@@ -1776,7 +1801,7 @@ fn updated_file_content(original: &str, section: &[String]) -> anyhow::Result<St
         }
     }
     output.extend(original_lines.into_iter().skip(index));
-    Ok(join_patch_lines(output, trailing_newline))
+    Ok(join_patch_lines(output, trailing_newline, line_ending))
 }
 
 fn update_hunks(section: &[String]) -> Vec<&[String]> {
@@ -1832,8 +1857,9 @@ fn hunk_matches_at(original_lines: &[String], start_index: usize, expected: &[St
     original_lines[start_index..start_index + expected.len()] == *expected
 }
 
-fn split_patch_text(value: &str) -> (Vec<String>, bool) {
+fn split_patch_text(value: &str) -> (Vec<String>, bool, &str) {
     let trailing_newline = value.ends_with('\n');
+    let line_ending = if value.contains("\r\n") { "\r\n" } else { "\n" };
     let lines = if value.is_empty() {
         Vec::new()
     } else {
@@ -1843,13 +1869,13 @@ fn split_patch_text(value: &str) -> (Vec<String>, bool) {
             .map(|line| line.trim_end_matches('\r').to_string())
             .collect()
     };
-    (lines, trailing_newline)
+    (lines, trailing_newline, line_ending)
 }
 
-fn join_patch_lines(lines: Vec<String>, trailing_newline: bool) -> String {
-    let mut value = lines.join("\n");
+fn join_patch_lines(lines: Vec<String>, trailing_newline: bool, line_ending: &str) -> String {
+    let mut value = lines.join(line_ending);
     if trailing_newline && !value.is_empty() {
-        value.push('\n');
+        value.push_str(line_ending);
     }
     value
 }
@@ -1902,10 +1928,6 @@ fn is_risky_shell_write(command: &str) -> bool {
         "move-item",
         "copy-item",
         "new-item",
-        "del ",
-        "rm ",
-        "mv ",
-        "cp ",
         "tee ",
         "cat >",
         "[system.io.file]::writealltext",
@@ -1927,8 +1949,18 @@ fn is_risky_shell_write(command: &str) -> bool {
         ".writeallbytes(",
     ];
     write_words.iter().any(|word| lower.contains(word))
+        || contains_shell_token(&lower, "del")
+        || contains_shell_token(&lower, "rm")
+        || contains_shell_token(&lower, "mv")
+        || contains_shell_token(&lower, "cp")
         || lower.contains(" > ")
         || lower.contains(">>")
+}
+
+fn contains_shell_token(command: &str, token: &str) -> bool {
+    command
+        .split(|character: char| !character.is_ascii_alphanumeric() && character != '_')
+        .any(|candidate| candidate == token)
 }
 
 fn pending_dir(cwd: &str) -> PathBuf {
@@ -2048,6 +2080,7 @@ PATCH"#,
     fn detects_shell_writes() {
         assert!(is_risky_shell_write("Set-Content file.txt value"));
         assert!(is_risky_shell_write("cat > file.txt"));
+        assert!(is_risky_shell_write("cp source.txt destination.txt"));
         assert!(is_risky_shell_write(
             "[System.IO.File]::WriteAllText($path, $newText)"
         ));
@@ -2055,6 +2088,14 @@ PATCH"#,
             "[System.IO.File]::WriteAllLines($path, $lines)"
         ));
         assert!(!is_risky_shell_write("cargo test --workspace"));
+        assert!(!is_risky_shell_write("codex mcp list"));
+    }
+
+    #[test]
+    fn detects_mixed_line_endings() {
+        assert!(!super::has_mixed_line_endings(b"alpha\nbeta\n"));
+        assert!(!super::has_mixed_line_endings(b"alpha\r\nbeta\r\n"));
+        assert!(super::has_mixed_line_endings(b"alpha\nbeta\r\n"));
     }
 
     #[test]
@@ -2534,7 +2575,7 @@ PATCH"#;
     fn plans_expected_after_digest_for_update_patch() {
         let fixture = Fixture::new("plans_expected_after_digest_for_update_patch");
         let file = fixture.root.join("a.txt");
-        assert!(std::fs::write(&file, "alpha").is_ok());
+        assert!(std::fs::write(&file, b"alpha\r\n").is_ok());
         let Some(root) = fixture.root.to_str() else {
             assert_eq!(fixture.root.display().to_string(), "");
             return;
@@ -2549,7 +2590,7 @@ PATCH"#;
 PATCH"#;
         let files = plan_patch_files(root, command);
         assert!(files.as_ref().is_ok_and(|files| files.len() == 1));
-        let expected = safeguard_core::blake3_hex(b"beta").as_hex().to_string();
+        let expected = safeguard_core::blake3_hex(b"beta\r\n").as_hex().to_string();
         assert_eq!(
             files
                 .ok()

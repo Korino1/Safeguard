@@ -3,6 +3,8 @@
 .safeguard/
 .safeguard-test-*
 target/
+dist/
+plugins/safeguard/bin/windows/*.pdb
 *.tmp
 *.bak
 *.log
@@ -10,6 +12,7 @@ target/
 AGENTS.md
 Concepts.txt
 gpt.txt
+Исправить*.txt
 IMPLEMENTATION_TRACKING.md
 NATIVE_CODEX_COMPATIBILITY_REQUIREMENTS.md
 SAFEGUARD_IMPLEMENTATION_PLAN.md

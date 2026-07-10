@@ -12,9 +12,9 @@ cargo build -p safeguard-mcp --release
 cargo build -p safeguard-hook --release
 mkdir -p "$PLUGIN_PATH/bin/linux"
 cp "$ROOT/target/release/safeguard-mcp" "$PLUGIN_PATH/bin/linux/safeguard-mcp"
-cp "$ROOT/target/release/safeguard-hook" "$PLUGIN_PATH/bin/linux/safeguard-hook"
+cp "$ROOT/target/release/safeguard-hook" "$PLUGIN_PATH/bin/linux/safeguard-hook-1.3.5"
 chmod +x "$PLUGIN_PATH/bin/linux/safeguard-mcp"
-chmod +x "$PLUGIN_PATH/bin/linux/safeguard-hook"
+chmod +x "$PLUGIN_PATH/bin/linux/safeguard-hook-1.3.5"
 cp "$PLUGIN_PATH/.mcp.linux.json" "$PLUGIN_PATH/.mcp.json"
 cp "$PLUGIN_PATH/hooks/hooks.linux.json" "$PLUGIN_PATH/hooks/hooks.json"
 
