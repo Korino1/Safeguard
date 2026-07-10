@@ -14,9 +14,9 @@ Current plugin id: `safeguard@safeguard-local`.
 - Exposes guarded text-replacement MCP tools as an explicit fallback/API.
 - Requires the old text fragment to appear exactly once before planning or applying an edit.
 - Enforces workspace-root containment for file edits.
-- Writes internal hook and MCP audit metadata to `.safeguard/audit.jsonl`.
-- Writes native edit execution receipts to `.safeguard/receipts/`.
-- Writes compact MemoryX-shaped evidence summaries to `.safeguard/evidence/`.
+- Writes internal hook and MCP audit metadata to external Safeguard state.
+- Writes native edit execution receipts to external Safeguard state.
+- Writes compact MemoryX-shaped evidence summaries to external Safeguard state.
 - Keeps hash/integrity metadata inside the plugin wrapper; normal model-facing responses do not expose digests.
 
 ## Repository Layout
@@ -62,12 +62,12 @@ Normal Codex editing should stay normal. The model can use native `apply_patch`;
 - `PreToolUse` records target files and before-digests for native `apply_patch`.
 - `PreToolUse` creates a guarded transaction record and target lock set.
 - `PostToolUse` records after-digests and changed-file evidence.
-- `PostToolUse` completes the transaction and releases target locks.
+- `PostToolUse` makes a final decision durable, writes the final receipt, then releases target locks and snapshots.
 - `PostToolUse` writes an `ExecutionReceipt v0.1` for the guarded edit.
 - Receipt acceptance requires both tool success and expected add/modify/delete result verification.
 - Receipts include a local hash-chain link through `previous_receipt_hash` when a prior receipt exists.
 - `PermissionRequest` denies risky direct shell writes in protect mode.
-- Internal digests are written to `.safeguard/audit.jsonl` and `.safeguard/receipts/`, not to model context.
+- Internal digests are written to the external Safeguard state root, not to model context.
 
 Policy mode:
 
@@ -76,7 +76,7 @@ Policy mode:
 
 Optional execution contract:
 
-- Set `SAFEGUARD_CONTRACT_PATH` to a local `ExecutionContract v0.1` JSON file when an orchestrator wants explicit capability enforcement.
+- Set `SAFEGUARD_CONTRACT_PATH` to a signed `ExecutionContract v0.1` envelope when an orchestrator wants explicit capability enforcement. Safeguard verifies Ed25519 signatures with public keys from its external authority store, binds the envelope to the workspace and issuer run id, and consumes its nonce once.
 - If no contract path is set, Safeguard creates an implicit local contract for native patch edits.
 - Contract parsing, capability checks, expected-file checks, and denied-resource checks happen inside the hook layer.
 
@@ -94,18 +94,19 @@ Use Codex normally. Safeguard protects native edit paths through plugin hooks.
 
 Use `sg_dry` only for explicit planning/debugging of deterministic text replacements. `sg_apply` remains listed for protocol compatibility, but returns a short refusal in transparent mode so models cannot bypass lifecycle hooks through MCP.
 
-Audit records are stored locally in `.safeguard/audit.jsonl`. Execution receipts are stored locally in `.safeguard/receipts/`. MemoryX-shaped evidence summaries are stored locally in `.safeguard/evidence/`. These files are ignored by git.
+Audit records, receipts, rollback snapshots, and MemoryX-shaped evidence summaries are stored outside the workspace: `%LOCALAPPDATA%\\Safeguard\\workspaces\\<workspace-blake3>` on Windows and `${XDG_STATE_HOME:-$HOME/.local/state}/Safeguard/workspaces/<workspace-blake3>` on Linux. They are not model context and are not written into the repository.
 
 ## Recovery
 
 If a hook transaction is interrupted before `PostToolUse`, recovery is explicit:
 
 ```powershell
-.\plugins\safeguard\bin\windows\safeguard-hook.exe recover --cwd <workspace> --list
-.\plugins\safeguard\bin\windows\safeguard-hook.exe recover --cwd <workspace> --rollback <transaction_id>
+.\plugins\safeguard\bin\windows\safeguard-hook-1.4.0.exe recover --cwd <workspace> --list
+.\plugins\safeguard\bin\windows\safeguard-hook-1.4.0.exe recover --cwd <workspace> --rollback <transaction_id>
+.\plugins\safeguard\bin\windows\safeguard-hook-1.4.0.exe recover --cwd <workspace> --finalize <transaction_id>
 ```
 
-Rollback restores guarded targets from local snapshots, releases Safeguard locks, removes the transaction record, and writes a rollback receipt.
+Rollback restores guarded targets from local snapshots, durably records rollback finality, writes a rollback receipt, then cleans local state. Interrupted finalization is resumed automatically on the next native hook invocation; `recover --finalize <transaction_id>` is available for explicit recovery.
 
 ## AI Agent Instructions
 

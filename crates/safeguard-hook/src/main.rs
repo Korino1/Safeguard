@@ -118,6 +118,7 @@ fn handle_recover_cli(args: &[String]) -> Value {
     let mut cwd = None;
     let mut list = false;
     let mut rollback = None;
+    let mut finalize = None;
     let mut index = 0;
     while index < args.len() {
         match args[index].as_str() {
@@ -139,6 +140,13 @@ fn handle_recover_cli(args: &[String]) -> Value {
                 rollback = Some(value.clone());
                 index += 2;
             }
+            "--finalize" => {
+                let Some(value) = args.get(index + 1) else {
+                    return recover_error("missing value for --finalize");
+                };
+                finalize = Some(value.clone());
+                index += 2;
+            }
             _ => return recover_error("unknown recover argument"),
         }
     }
@@ -148,7 +156,7 @@ fn handle_recover_cli(args: &[String]) -> Value {
             .map(|path| path.display().to_string())
             .unwrap_or_else(|_| ".".to_string())
     });
-    if list || rollback.is_none() {
+    if list || (rollback.is_none() && finalize.is_none()) {
         return match safeguard_transaction::recovery_candidates(state_root(&cwd)) {
             Ok(candidates) => json!({
                 "ok": true,
@@ -156,14 +164,18 @@ fn handle_recover_cli(args: &[String]) -> Value {
                 "count": candidates.len(),
                 "records": candidates
                     .into_iter()
-                    .map(|candidate| candidate.record_path.display().to_string())
+                    .map(|candidate| json!({
+                        "path": candidate.record_path.display().to_string(),
+                        "transaction_id": candidate.transaction_id.as_str(),
+                        "finality": format!("{:?}", candidate.finality)
+                    }))
                     .collect::<Vec<_>>()
             }),
-            Err(err) => recover_error(&model_safe_transaction_error(err).to_string()),
+            Err(err) => recover_error(&err.to_string()),
         };
     }
 
-    let transaction_id = match rollback {
+    let transaction_id = match rollback.or(finalize) {
         Some(value) => value,
         None => return recover_error("missing transaction id"),
     };
@@ -171,16 +183,53 @@ fn handle_recover_cli(args: &[String]) -> Value {
         Ok(id) => id,
         Err(err) => return recover_error(&model_safe_transaction_error(err).to_string()),
     };
-    match safeguard_transaction::rollback_transaction(state_root(&cwd), &id) {
-        Ok(Some(record)) => {
-            let receipt_path = write_recovery_receipt(&cwd, &transaction_id, &record).ok();
-            json!({
+    if args.iter().any(|argument| argument == "--finalize") {
+        return match recover_transaction_finality(&cwd, &id) {
+            Ok(Some(finality)) => json!({
                 "ok": true,
-                "operation": "rollback",
+                "operation": "finalize",
                 "transaction_id": transaction_id,
-                "targets": record.targets.len(),
-                "receipt_path": receipt_path.map(|path| path.display().to_string())
-            })
+                "finality": format!("{:?}", finality)
+            }),
+            Ok(None) => recover_error("transaction record not found"),
+            Err(err) => recover_error(&err.to_string()),
+        };
+    }
+    match safeguard_transaction::restore_transaction(state_root(&cwd), &id) {
+        Ok(Some(record)) => {
+            match safeguard_transaction::mark_rollback_decision(state_root(&cwd), &id)
+                .and_then(|_| {
+                    write_recovery_receipt(
+                        &cwd,
+                        &transaction_id,
+                        &record,
+                        safeguard_protocol::ReceiptStatus::RolledBack,
+                    )
+                    .map_err(|source| {
+                        safeguard_transaction::TransactionError::Io {
+                            operation: "write rollback recovery receipt",
+                            path: state_root(&cwd),
+                            source: std::io::Error::other(source),
+                        }
+                    })
+                })
+                .and_then(|receipt_path| {
+                    safeguard_transaction::mark_rolled_back_receipt(state_root(&cwd), &id)
+                        .map(|_| receipt_path)
+                })
+                .and_then(|receipt_path| {
+                    safeguard_transaction::complete_transaction(state_root(&cwd), &id)
+                        .map(|_| receipt_path)
+                }) {
+                Ok(receipt_path) => json!({
+                    "ok": true,
+                    "operation": "rollback",
+                    "transaction_id": transaction_id,
+                    "targets": record.targets.len(),
+                    "receipt_path": receipt_path.display().to_string()
+                }),
+                Err(err) => recover_error(&model_safe_transaction_error(err).to_string()),
+            }
         }
         Ok(None) => recover_error("transaction record not found"),
         Err(err) => recover_error(&model_safe_transaction_error(err).to_string()),
@@ -194,7 +243,81 @@ fn recover_error(reason: &str) -> Value {
     })
 }
 
+/// Finish durable decisions left by a terminated hook process. Prepared edits
+/// are rolled back; a durable commit decision is never converted into rollback.
+fn recover_durable_transactions(cwd: &str) -> anyhow::Result<()> {
+    for candidate in safeguard_transaction::recovery_candidates(state_root(cwd))? {
+        let _ = recover_transaction_finality(cwd, &candidate.transaction_id)?;
+    }
+    Ok(())
+}
+
+fn recover_transaction_finality(
+    cwd: &str,
+    id: &safeguard_transaction::TransactionId,
+) -> anyhow::Result<Option<safeguard_transaction::TransactionFinality>> {
+    let state = state_root(cwd);
+    let Some(record) = safeguard_transaction::load_transaction_record(&state, id)? else {
+        return Ok(None);
+    };
+    let mut finality = safeguard_transaction::transaction_finality(&state, id)?;
+    match finality {
+        safeguard_transaction::TransactionFinality::Prepared => {
+            safeguard_transaction::restore_transaction(&state, id)?;
+            safeguard_transaction::mark_rollback_decision(&state, id)?;
+            finality = safeguard_transaction::TransactionFinality::RollbackDecisionDurable;
+        }
+        safeguard_transaction::TransactionFinality::CommitDecisionDurable
+        | safeguard_transaction::TransactionFinality::AcceptedReceiptDurable
+        | safeguard_transaction::TransactionFinality::RollbackDecisionDurable
+        | safeguard_transaction::TransactionFinality::RolledBackReceiptDurable => {}
+    }
+
+    match finality {
+        safeguard_transaction::TransactionFinality::CommitDecisionDurable => {
+            write_recovery_receipt(
+                cwd,
+                id.as_str(),
+                &record,
+                safeguard_protocol::ReceiptStatus::Accepted,
+            )?;
+            safeguard_transaction::mark_accepted_receipt(&state, id)?;
+            finality = safeguard_transaction::TransactionFinality::AcceptedReceiptDurable;
+        }
+        safeguard_transaction::TransactionFinality::RollbackDecisionDurable => {
+            write_recovery_receipt(
+                cwd,
+                id.as_str(),
+                &record,
+                safeguard_protocol::ReceiptStatus::RolledBack,
+            )?;
+            safeguard_transaction::mark_rolled_back_receipt(&state, id)?;
+            finality = safeguard_transaction::TransactionFinality::RolledBackReceiptDurable;
+        }
+        safeguard_transaction::TransactionFinality::Prepared
+        | safeguard_transaction::TransactionFinality::AcceptedReceiptDurable
+        | safeguard_transaction::TransactionFinality::RolledBackReceiptDurable => {}
+    }
+    if matches!(
+        finality,
+        safeguard_transaction::TransactionFinality::AcceptedReceiptDurable
+            | safeguard_transaction::TransactionFinality::RolledBackReceiptDurable
+    ) {
+        safeguard_transaction::complete_transaction(&state, id)?;
+    }
+    Ok(Some(finality))
+}
+
 fn pre_tool_use(request: &HookRequest) -> Value {
+    if let Err(err) = recover_durable_transactions(&request.cwd) {
+        let _ = append_policy_audit(
+            &request.cwd,
+            json!({
+                "operation": "automatic_transaction_recovery_failed",
+                "reason": err.to_string()
+            }),
+        );
+    }
     let tool_name = request.tool_name.as_deref().unwrap_or_default();
     if is_safeguard_mcp_tool(tool_name) {
         return continue_output();
@@ -396,10 +519,9 @@ fn post_tool_use(request: &HookRequest) -> Value {
             );
             match prepared {
                 Ok(_) => {
-                    match safeguard_transaction::complete_transaction(state_root(&pending.cwd), &id)
+                    match safeguard_transaction::mark_commit_decision(state_root(&pending.cwd), &id)
                     {
-                        Ok(()) => {
-                            transaction_cleaned = true;
+                        Ok(_) => {
                             match write_execution_receipt(
                                 &pending,
                                 ReceiptOutcome {
@@ -415,24 +537,48 @@ fn post_tool_use(request: &HookRequest) -> Value {
                             ) {
                                 Ok(_) => {
                                     receipt_written = true;
+                                    match safeguard_transaction::mark_accepted_receipt(
+                                        state_root(&pending.cwd),
+                                        &id,
+                                    ) {
+                                        Ok(()) => {
+                                            match safeguard_transaction::complete_transaction(
+                                                state_root(&pending.cwd),
+                                                &id,
+                                            ) {
+                                                Ok(()) => {
+                                                    transaction_cleaned = true;
+                                                }
+                                                Err(err) => {
+                                                    completion_error = Some(
+                                                        model_safe_transaction_error(err)
+                                                            .to_string(),
+                                                    );
+                                                    let _ = write_quarantine_marker(
+                                                        &pending,
+                                                        "accepted_cleanup_pending",
+                                                    );
+                                                }
+                                            }
+                                        }
+                                        Err(err) => {
+                                            receipt_status =
+                                                safeguard_protocol::ReceiptStatus::Partial;
+                                            completion_error =
+                                                Some(model_safe_transaction_error(err).to_string());
+                                            let _ = write_quarantine_marker(
+                                                &pending,
+                                                "accepted_receipt_finality_pending",
+                                            );
+                                        }
+                                    }
                                 }
                                 Err(err) => {
                                     receipt_status = safeguard_protocol::ReceiptStatus::Partial;
                                     completion_error = Some(format!("receipt write failed: {err}"));
-                                    let _ =
-                                        write_quarantine_marker(&pending, "receipt_write_failed");
-                                    let _ = write_execution_receipt(
+                                    let _ = write_quarantine_marker(
                                         &pending,
-                                        ReceiptOutcome {
-                                            status: receipt_status.clone(),
-                                            expected_result_verified,
-                                            validations_passed,
-                                            rollback_completed,
-                                            completion_error: completion_error.clone(),
-                                        },
-                                        started_at,
-                                        changed_files.clone(),
-                                        validations.clone(),
+                                        "accepted_receipt_pending",
                                     );
                                 }
                             }
@@ -440,20 +586,7 @@ fn post_tool_use(request: &HookRequest) -> Value {
                         Err(err) => {
                             receipt_status = safeguard_protocol::ReceiptStatus::Partial;
                             completion_error = Some(model_safe_transaction_error(err).to_string());
-                            let _ = write_quarantine_marker(&pending, "commit_failed");
-                            let _ = write_execution_receipt(
-                                &pending,
-                                ReceiptOutcome {
-                                    status: receipt_status.clone(),
-                                    expected_result_verified,
-                                    validations_passed,
-                                    rollback_completed,
-                                    completion_error: completion_error.clone(),
-                                },
-                                started_at,
-                                changed_files.clone(),
-                                validations.clone(),
-                            );
+                            let _ = write_quarantine_marker(&pending, "commit_decision_pending");
                         }
                     }
                 }
@@ -464,47 +597,36 @@ fn post_tool_use(request: &HookRequest) -> Value {
                 }
             }
         }
-        Ok(id) => match safeguard_transaction::restore_transaction(state_root(&pending.cwd), &id) {
-            Ok(Some(_record)) => {
-                rollback_completed = Some(true);
-                if validation_side_effects {
-                    receipt_status = safeguard_protocol::ReceiptStatus::Partial;
-                    completion_error =
-                        Some("validation modified undeclared workspace files".to_string());
-                    let _ = write_quarantine_marker(&pending, "validation_side_effects");
-                }
-                match write_execution_receipt(
-                    &pending,
-                    ReceiptOutcome {
-                        status: receipt_status.clone(),
-                        expected_result_verified,
-                        validations_passed,
-                        rollback_completed,
-                        completion_error: completion_error.clone(),
-                    },
-                    started_at,
-                    changed_files.clone(),
-                    validations.clone(),
-                ) {
-                    Ok(_) => {
-                        receipt_written = true;
-                        if !validation_side_effects {
-                            match safeguard_transaction::complete_transaction(
+        Ok(id) => {
+            match safeguard_transaction::restore_transaction(state_root(&pending.cwd), &id) {
+                Ok(Some(_record)) => {
+                    rollback_completed = Some(true);
+                    if validation_side_effects {
+                        receipt_status = safeguard_protocol::ReceiptStatus::Partial;
+                        completion_error =
+                            Some("validation modified undeclared workspace files".to_string());
+                        let _ = write_quarantine_marker(&pending, "validation_side_effects");
+                    }
+                    match write_execution_receipt(
+                        &pending,
+                        ReceiptOutcome {
+                            status: safeguard_protocol::ReceiptStatus::Prepared,
+                            expected_result_verified,
+                            validations_passed,
+                            rollback_completed,
+                            completion_error: completion_error.clone(),
+                        },
+                        started_at,
+                        changed_files.clone(),
+                        validations.clone(),
+                    ) {
+                        Ok(_) => {
+                            match safeguard_transaction::mark_rollback_decision(
                                 state_root(&pending.cwd),
                                 &id,
                             ) {
                                 Ok(()) => {
-                                    transaction_cleaned = true;
-                                }
-                                Err(err) => {
-                                    receipt_status = safeguard_protocol::ReceiptStatus::Partial;
-                                    completion_error =
-                                        Some(model_safe_transaction_error(err).to_string());
-                                    let _ = write_quarantine_marker(
-                                        &pending,
-                                        "rollback_cleanup_failed",
-                                    );
-                                    let _ = write_execution_receipt(
+                                    match write_execution_receipt(
                                         &pending,
                                         ReceiptOutcome {
                                             status: receipt_status.clone(),
@@ -516,65 +638,112 @@ fn post_tool_use(request: &HookRequest) -> Value {
                                         started_at,
                                         changed_files.clone(),
                                         validations.clone(),
+                                    ) {
+                                        Ok(_) => {
+                                            receipt_written = true;
+                                            match safeguard_transaction::mark_rolled_back_receipt(
+                                        state_root(&pending.cwd),
+                                        &id,
+                                    ) {
+                                        Ok(()) if !validation_side_effects => {
+                                            match safeguard_transaction::complete_transaction(
+                                                state_root(&pending.cwd),
+                                                &id,
+                                            ) {
+                                                Ok(()) => transaction_cleaned = true,
+                                                Err(err) => {
+                                                    receipt_status = safeguard_protocol::ReceiptStatus::Partial;
+                                                    completion_error = Some(model_safe_transaction_error(err).to_string());
+                                                    let _ = write_quarantine_marker(&pending, "rollback_cleanup_pending");
+                                                }
+                                            }
+                                        }
+                                        Ok(()) => {}
+                                        Err(err) => {
+                                            receipt_status = safeguard_protocol::ReceiptStatus::Partial;
+                                            completion_error = Some(model_safe_transaction_error(err).to_string());
+                                            let _ = write_quarantine_marker(&pending, "rollback_receipt_finality_pending");
+                                        }
+                                    }
+                                        }
+                                        Err(err) => {
+                                            receipt_status =
+                                                safeguard_protocol::ReceiptStatus::Partial;
+                                            completion_error =
+                                                Some(format!("receipt write failed: {err}"));
+                                            let _ = write_quarantine_marker(
+                                                &pending,
+                                                "rollback_receipt_pending",
+                                            );
+                                        }
+                                    }
+                                }
+                                Err(err) => {
+                                    receipt_status = safeguard_protocol::ReceiptStatus::Partial;
+                                    completion_error =
+                                        Some(model_safe_transaction_error(err).to_string());
+                                    let _ = write_quarantine_marker(
+                                        &pending,
+                                        "rollback_decision_pending",
                                     );
                                 }
                             }
                         }
+                        Err(err) => {
+                            receipt_status = safeguard_protocol::ReceiptStatus::Partial;
+                            completion_error = Some(format!("receipt write failed: {err}"));
+                            let _ = write_quarantine_marker(&pending, "receipt_write_failed");
+                        }
                     }
-                    Err(err) => {
-                        receipt_status = safeguard_protocol::ReceiptStatus::Partial;
-                        completion_error = Some(format!("receipt write failed: {err}"));
-                        let _ = write_quarantine_marker(&pending, "receipt_write_failed");
+                }
+                Ok(None) => {
+                    receipt_status = safeguard_protocol::ReceiptStatus::Partial;
+                    rollback_completed = Some(false);
+                    completion_error = Some("transaction record not found".to_string());
+                    let _ = write_quarantine_marker(&pending, "rollback_record_missing");
+                    if write_execution_receipt(
+                        &pending,
+                        ReceiptOutcome {
+                            status: receipt_status.clone(),
+                            expected_result_verified,
+                            validations_passed,
+                            rollback_completed,
+                            completion_error: completion_error.clone(),
+                        },
+                        started_at,
+                        changed_files.clone(),
+                        validations.clone(),
+                    )
+                    .is_ok()
+                    {
+                        receipt_written = true;
+                    }
+                }
+                Err(err) => {
+                    receipt_status = safeguard_protocol::ReceiptStatus::Partial;
+                    rollback_completed = Some(false);
+                    completion_error = Some(model_safe_transaction_error(err).to_string());
+                    let _ = write_quarantine_marker(&pending, "rollback_failed");
+                    if write_execution_receipt(
+                        &pending,
+                        ReceiptOutcome {
+                            status: receipt_status.clone(),
+                            expected_result_verified,
+                            validations_passed,
+                            rollback_completed,
+                            completion_error: completion_error.clone(),
+                        },
+                        started_at,
+                        changed_files.clone(),
+                        validations.clone(),
+                    )
+                    .is_ok()
+                    {
+                        receipt_written = true;
                     }
                 }
             }
-            Ok(None) => {
-                receipt_status = safeguard_protocol::ReceiptStatus::Partial;
-                rollback_completed = Some(false);
-                completion_error = Some("transaction record not found".to_string());
-                let _ = write_quarantine_marker(&pending, "rollback_record_missing");
-                if write_execution_receipt(
-                    &pending,
-                    ReceiptOutcome {
-                        status: receipt_status.clone(),
-                        expected_result_verified,
-                        validations_passed,
-                        rollback_completed,
-                        completion_error: completion_error.clone(),
-                    },
-                    started_at,
-                    changed_files.clone(),
-                    validations.clone(),
-                )
-                .is_ok()
-                {
-                    receipt_written = true;
-                }
-            }
-            Err(err) => {
-                receipt_status = safeguard_protocol::ReceiptStatus::Partial;
-                rollback_completed = Some(false);
-                completion_error = Some(model_safe_transaction_error(err).to_string());
-                let _ = write_quarantine_marker(&pending, "rollback_failed");
-                if write_execution_receipt(
-                    &pending,
-                    ReceiptOutcome {
-                        status: receipt_status.clone(),
-                        expected_result_verified,
-                        validations_passed,
-                        rollback_completed,
-                        completion_error: completion_error.clone(),
-                    },
-                    started_at,
-                    changed_files.clone(),
-                    validations.clone(),
-                )
-                .is_ok()
-                {
-                    receipt_written = true;
-                }
-            }
-        },
+        }
         Err(err) => {
             receipt_status = safeguard_protocol::ReceiptStatus::Partial;
             completion_error = Some(model_safe_transaction_error(err).to_string());
@@ -1391,13 +1560,14 @@ fn write_recovery_receipt(
     cwd: &str,
     transaction_id: &str,
     record: &safeguard_transaction::TransactionRecord,
+    status: safeguard_protocol::ReceiptStatus,
 ) -> anyhow::Result<PathBuf> {
     let receipt_id = format!("recovery-{}", safe_file_id(transaction_id));
     let mut receipt = safeguard_protocol::ExecutionReceipt {
         schema_version: safeguard_protocol::SCHEMA_VERSION_0_1.to_string(),
         contract_id: transaction_id.to_string(),
         receipt_id,
-        status: safeguard_protocol::ReceiptStatus::RolledBack,
+        status: status.clone(),
         started_at: format!("unix:{}", record.started_at),
         completed_at: format!("unix:{}", current_unix_timestamp()),
         executor: safeguard_protocol::ReceiptExecutor {
@@ -1409,7 +1579,11 @@ fn write_recovery_receipt(
             .iter()
             .map(|target| safeguard_protocol::ObservedOperation {
                 tool: "safeguard-hook".to_string(),
-                operation: "recover.rollback".to_string(),
+                operation: if status == safeguard_protocol::ReceiptStatus::Accepted {
+                    "recover.finalize_commit".to_string()
+                } else {
+                    "recover.rollback".to_string()
+                },
                 path: Some(target.path.display().to_string()),
                 command: None,
             })
@@ -1432,7 +1606,11 @@ fn write_recovery_receipt(
         validations: Vec::new(),
         policy_violations: Vec::new(),
         invariants: vec![safeguard_protocol::InvariantResult {
-            name: "rollback_completed".to_string(),
+            name: if status == safeguard_protocol::ReceiptStatus::Accepted {
+                "transaction_finality_durable".to_string()
+            } else {
+                "rollback_completed".to_string()
+            },
             status: safeguard_protocol::InvariantStatus::Passed,
         }],
         receipt_hash: None,
@@ -1901,7 +2079,7 @@ fn resolve_patch_path(cwd: &Path, patch_path: &str) -> anyhow::Result<PathBuf> {
 }
 
 fn reject_internal_state_target(cwd: &Path, target: &Path) -> anyhow::Result<()> {
-    let state_root = cwd.join(".safeguard");
+    let state_root = safeguard_core::legacy_workspace_state_root(cwd);
     let state_root = if state_root.exists() {
         state_root.canonicalize()?
     } else {
@@ -1972,7 +2150,7 @@ fn audit_path(cwd: &str) -> PathBuf {
 }
 
 fn state_root(cwd: &str) -> PathBuf {
-    PathBuf::from(cwd).join(".safeguard")
+    safeguard_core::workspace_state_root(PathBuf::from(cwd))
 }
 
 fn write_pending(pending: &PendingEdit) -> anyhow::Result<()> {
@@ -3162,11 +3340,14 @@ PATCH"#;
     }
 
     fn first_receipt(root: &str) -> Option<serde_json::Value> {
-        let path = std::fs::read_dir(state_root(root).join("receipts"))
+        let mut paths = std::fs::read_dir(state_root(root).join("receipts"))
             .ok()?
             .filter_map(Result::ok)
             .map(|entry| entry.path())
-            .find(|path| path.extension().and_then(|value| value.to_str()) == Some("json"))?;
+            .filter(|path| path.extension().and_then(|value| value.to_str()) == Some("json"))
+            .collect::<Vec<_>>();
+        paths.sort();
+        let path = paths.pop()?;
         let bytes = std::fs::read(path).ok()?;
         serde_json::from_slice(&bytes).ok()
     }
@@ -3210,7 +3391,9 @@ PATCH"#;
 
     impl Drop for Fixture {
         fn drop(&mut self) {
+            let state = state_root(&self.root.display().to_string());
             let _ = std::fs::remove_dir_all(&self.root);
+            let _ = std::fs::remove_dir_all(state);
         }
     }
 }

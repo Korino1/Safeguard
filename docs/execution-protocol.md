@@ -92,7 +92,7 @@ execution_contract:
 - `required_validations` define checks that must be attached to the receipt before acceptance. Current execution is blocking and not sandboxed.
 - `invariants` are reserved for future evaluator-backed checks. Non-empty contract invariants are rejected in v0.1 until an evaluator registry exists.
 - `subject.agent_id` and `subject.model` are reserved for future trusted runtime binding. Non-empty subject fields are rejected in v0.1 until Safeguard receives a trusted subject context.
-- Explicit contract files loaded through `SAFEGUARD_CONTRACT_PATH` must be outside the workspace and must match the wrapper-provided `SAFEGUARD_CONTRACT_BLAKE3` value. This is a local trust boundary, not a replacement for future Cabal signatures or trusted IPC.
+- Explicit contracts use a signed authority envelope: canonical contract JSON plus `key_id`, nonce, canonical workspace identity, issuer run id, and an Ed25519 signature. Safeguard verifies the signature against an external local public-key trust store and consumes the nonce in its external state root. The envelope and its key material must be outside the workspace. The earlier BLAKE3 environment-hash loader exists only behind the explicit compatibility switch `SAFEGUARD_ALLOW_LEGACY_CONTRACT_HASH=1`.
 
 ## ExecutionReceipt v0.1
 
@@ -136,12 +136,12 @@ execution_receipt:
 Receipt status values:
 
 - `prepared`: execution is durably prepared but not finally accepted;
-- `accepted`: final success after transaction completion;
+- `accepted`: final success after a durable commit decision and durable receipt;
 - `rejected`: denied or rejected execution;
 - `partial`: incomplete state requiring quarantine/recovery handling;
 - `rolled_back`: rollback completed.
 
-`accepted` is final-only. Safeguard must not emit an accepted receipt before transaction completion succeeds.
+`accepted` is final-only. Safeguard first persists `CommitDecisionDurable`, then commits the accepted receipt, then records `AcceptedReceiptDurable`; rollback follows the symmetric `RollbackDecisionDurable` and `RolledBackReceiptDurable` path. Cleanup happens only after finality is durable and can be resumed automatically by the next native hook invocation or explicitly with `recover --finalize`.
 
 ### Receipt Semantics
 
@@ -168,7 +168,7 @@ memoryx_evidence:
     contract_hash: "digest"
     receipt_hash: "digest"
     source_paths:
-      - ".safeguard/receipts/receipt-id.json"
+      - "<external-state-root>/receipts/receipt-id.json"
   summary:
     changed_files_count: 1
     validations_passed: 2
@@ -194,10 +194,11 @@ Implemented now:
 - initial transaction crate with locks, digest CAS, rollback snapshots, recovery candidate scan, and `ExecutionContract` target mapping;
 - hook-side implicit `ExecutionContract` binding for native `apply_patch`;
 - optional explicit `ExecutionContract` loading through `SAFEGUARD_CONTRACT_PATH`;
-- explicit contract source hardening: contract file must be outside the workspace and match `SAFEGUARD_CONTRACT_BLAKE3`;
+- signed explicit-contract authority: Ed25519 verification against an external public-key trust store, workspace/run-id binding, and one-time nonces;
+- legacy explicit-contract source hardening retained only as an opt-in compatibility path: source outside the workspace plus `SAFEGUARD_CONTRACT_BLAKE3`;
 - hook-side capability, expected-file, and denied-resource enforcement for explicit contracts;
 - explicit contracts mediate native apply-patch and guarded edit paths, not arbitrary process/network execution;
-- persistent transaction lifecycle across separate `PreToolUse` and `PostToolUse` hook processes;
+- persistent transaction lifecycle across separate `PreToolUse` and `PostToolUse` hook processes with crash-safe finality markers and automatic recovery;
 - hook-side `ExecutionReceipt v0.1` emission for guarded native edits;
 - receipt-level expected add/modify/delete result verification;
 - exact expected after-content digest verification for standard `apply_patch` edits;
@@ -205,14 +206,13 @@ Implemented now:
 - required validation command execution for explicit contracts; validation failure prevents acceptance and triggers rollback;
 - append-only receipt files with monotonic sequence ids;
 - serialized receipt chain-head updates through a local chain lock, with continuity through `previous_receipt_hash`;
-- hard denial of native patch targets inside `.safeguard/**`;
+- external per-workspace trusted state roots for transactions, receipts, evidence, audits, pending edits, and nonce consumption; legacy `.safeguard/**` targets remain denied;
 - local MemoryX-shaped evidence summary export from contract and receipt hashes;
 - explicit recovery CLI for listing interrupted transactions and rolling them back with recovery receipts.
 
 Next Safeguard implementation steps:
 
-- authenticate contract authority with signed or trusted-IPC delivery;
+- add a local Cabal signer/key-install tool and optional trusted IPC delivery;
 - reject or mediate ordinary Bash/process/network side effects under a future full execution contract;
-- add a crash-safe state machine for commit decision, final receipt recovery, and symmetric rollback finality;
-- move trusted state out of the editable workspace;
+- add OS-level validation sandboxing with process-tree limits and network isolation;
 - share one receipt/evidence writer between hook and MCP.

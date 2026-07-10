@@ -193,11 +193,30 @@ pub struct TransactionRecord {
     pub targets: Vec<LockedTarget>,
 }
 
+/// Durable finality reached by a persisted transaction and recovery state machine.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TransactionFinality {
+    /// No durable final decision exists; recovery rolls the edit back.
+    Prepared,
+    /// A successful edit decision is durable but the final receipt is pending.
+    CommitDecisionDurable,
+    /// The accepted receipt is durable; only local cleanup remains.
+    AcceptedReceiptDurable,
+    /// Rollback is durable but the final receipt is pending.
+    RollbackDecisionDurable,
+    /// The rollback receipt is durable; only local cleanup remains.
+    RolledBackReceiptDurable,
+}
+
 /// Summary of transaction records left after an interrupted run.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RecoveryCandidate {
     /// Path to the transaction record.
     pub record_path: PathBuf,
+    /// Persisted transaction id.
+    pub transaction_id: TransactionId,
+    /// Last durable finality marker.
+    pub finality: TransactionFinality,
 }
 
 /// Transaction layer errors.
@@ -423,7 +442,15 @@ pub fn recovery_candidates(
         })?;
         let path = entry.path();
         if path.extension().and_then(|value| value.to_str()) == Some("json") {
-            candidates.push(RecoveryCandidate { record_path: path });
+            let Some(stem) = path.file_stem().and_then(|value| value.to_str()) else {
+                continue;
+            };
+            let id = TransactionId::new(stem.to_string())?;
+            candidates.push(RecoveryCandidate {
+                record_path: path,
+                transaction_id: id.clone(),
+                finality: transaction_finality(state_root.as_ref(), &id)?,
+            });
         }
     }
     candidates.sort_by(|left, right| left.record_path.cmp(&right.record_path));
@@ -447,6 +474,79 @@ pub fn load_transaction_record(
     serde_json::from_slice(&bytes)
         .map(Some)
         .map_err(TransactionError::DeserializeRecord)
+}
+
+/// Read the highest durable finality marker for a transaction.
+pub fn transaction_finality(
+    state_root: impl AsRef<Path>,
+    id: &TransactionId,
+) -> Result<TransactionFinality, TransactionError> {
+    let state_root = state_root.as_ref();
+    if finality_marker_path(state_root, id, "accepted-receipt").exists() {
+        return Ok(TransactionFinality::AcceptedReceiptDurable);
+    }
+    if finality_marker_path(state_root, id, "rolled-back-receipt").exists() {
+        return Ok(TransactionFinality::RolledBackReceiptDurable);
+    }
+    if finality_marker_path(state_root, id, "commit-decision").exists() {
+        return Ok(TransactionFinality::CommitDecisionDurable);
+    }
+    if finality_marker_path(state_root, id, "rollback-decision").exists() {
+        return Ok(TransactionFinality::RollbackDecisionDurable);
+    }
+    Ok(TransactionFinality::Prepared)
+}
+
+/// Persist the irreversible decision to keep a verified edit.
+pub fn mark_commit_decision(
+    state_root: impl AsRef<Path>,
+    id: &TransactionId,
+) -> Result<(), TransactionError> {
+    mark_finality(
+        state_root.as_ref(),
+        id,
+        "commit-decision",
+        "rollback-decision",
+    )
+}
+
+/// Persist that the accepted execution receipt has been committed.
+pub fn mark_accepted_receipt(
+    state_root: impl AsRef<Path>,
+    id: &TransactionId,
+) -> Result<(), TransactionError> {
+    mark_finality(
+        state_root.as_ref(),
+        id,
+        "accepted-receipt",
+        "rollback-decision",
+    )
+}
+
+/// Persist that rollback was performed and must be finalized.
+pub fn mark_rollback_decision(
+    state_root: impl AsRef<Path>,
+    id: &TransactionId,
+) -> Result<(), TransactionError> {
+    mark_finality(
+        state_root.as_ref(),
+        id,
+        "rollback-decision",
+        "commit-decision",
+    )
+}
+
+/// Persist that the rollback receipt has been committed.
+pub fn mark_rolled_back_receipt(
+    state_root: impl AsRef<Path>,
+    id: &TransactionId,
+) -> Result<(), TransactionError> {
+    mark_finality(
+        state_root.as_ref(),
+        id,
+        "rolled-back-receipt",
+        "commit-decision",
+    )
 }
 
 /// Complete a persisted transaction and release its lock files.
@@ -492,6 +592,21 @@ pub fn complete_transaction(
             path: rollback_dir,
             source,
         })?;
+    }
+    for marker in [
+        "commit-decision",
+        "accepted-receipt",
+        "rollback-decision",
+        "rolled-back-receipt",
+    ] {
+        let path = finality_marker_path(state_root, id, marker);
+        if path.exists() {
+            std::fs::remove_file(&path).map_err(|source| TransactionError::Io {
+                operation: "remove transaction finality marker",
+                path,
+                source,
+            })?;
+        }
     }
     Ok(())
 }
@@ -660,6 +775,59 @@ fn transaction_record_path(state_root: &Path, id: &TransactionId) -> PathBuf {
         .join(format!("{}.json", id.as_str()))
 }
 
+fn finality_marker_path(state_root: &Path, id: &TransactionId, marker: &str) -> PathBuf {
+    state_root
+        .join("transactions")
+        .join(format!("{}.{}.marker", id.as_str(), marker))
+}
+
+fn mark_finality(
+    state_root: &Path,
+    id: &TransactionId,
+    marker: &str,
+    conflicting_marker: &str,
+) -> Result<(), TransactionError> {
+    let record_path = transaction_record_path(state_root, id);
+    if !record_path.exists() {
+        return Err(TransactionError::Io {
+            operation: "locate persisted transaction record",
+            path: record_path,
+            source: std::io::Error::from(std::io::ErrorKind::NotFound),
+        });
+    }
+    let conflicting = finality_marker_path(state_root, id, conflicting_marker);
+    if conflicting.exists() {
+        return Err(TransactionError::Io {
+            operation: "reject conflicting transaction finality",
+            path: conflicting,
+            source: std::io::Error::from(std::io::ErrorKind::AlreadyExists),
+        });
+    }
+    let path = finality_marker_path(state_root, id, marker);
+    match OpenOptions::new().write(true).create_new(true).open(&path) {
+        Ok(mut file) => {
+            writeln!(file, "transaction_id={}", id.as_str()).map_err(|source| {
+                TransactionError::Io {
+                    operation: "write transaction finality marker",
+                    path: path.clone(),
+                    source,
+                }
+            })?;
+            file.sync_all().map_err(|source| TransactionError::Io {
+                operation: "sync transaction finality marker",
+                path,
+                source,
+            })
+        }
+        Err(source) if source.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+        Err(source) => Err(TransactionError::Io {
+            operation: "create transaction finality marker",
+            path,
+            source,
+        }),
+    }
+}
+
 fn lock_path_for_key(state_root: &Path, lock_key: &str) -> PathBuf {
     state_root.join("locks").join(format!("{lock_key}.lock"))
 }
@@ -712,15 +880,19 @@ mod tests {
     use safeguard_protocol::FileOperation;
 
     use super::TransactionError;
+    use super::TransactionFinality;
     use super::TransactionId;
     use super::TransactionTarget;
     use super::begin_transaction;
     use super::complete_transaction;
     use super::load_transaction_record;
+    use super::mark_accepted_receipt;
+    use super::mark_commit_decision;
     use super::recovery_candidates;
     use super::restore_transaction;
     use super::rollback_transaction;
     use super::targets_from_contract;
+    use super::transaction_finality;
     use super::transaction_id_from_contract;
 
     #[test]
@@ -806,6 +978,46 @@ mod tests {
                 .exists()
         );
         assert!(!fixture.state.join("rollback").join(id.as_str()).exists());
+    }
+
+    #[test]
+    fn finality_marker_survives_until_cleanup() {
+        let fixture = Fixture::new("finality_marker_survives_until_cleanup");
+        let file = fixture.workspace.join("a.txt");
+        assert!(std::fs::write(&file, "alpha").is_ok());
+        let id = valid_id("tx-finality");
+        let guard = begin_transaction(
+            &fixture.workspace,
+            &fixture.state,
+            id.clone(),
+            &[TransactionTarget {
+                path: PathBuf::from("a.txt"),
+                expected_blake3: None,
+            }],
+        );
+        assert!(guard.is_ok());
+        let Ok(guard) = guard else {
+            return;
+        };
+        assert!(guard.persist_record_keep_locks().is_ok());
+        assert!(mark_commit_decision(&fixture.state, &id).is_ok());
+        assert!(matches!(
+            transaction_finality(&fixture.state, &id),
+            Ok(TransactionFinality::CommitDecisionDurable)
+        ));
+        assert!(mark_accepted_receipt(&fixture.state, &id).is_ok());
+        assert!(matches!(
+            transaction_finality(&fixture.state, &id),
+            Ok(TransactionFinality::AcceptedReceiptDurable)
+        ));
+        assert!(complete_transaction(&fixture.state, &id).is_ok());
+        assert!(
+            !fixture
+                .state
+                .join("transactions")
+                .join("tx-finality.accepted-receipt.marker")
+                .exists()
+        );
     }
 
     #[test]

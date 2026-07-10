@@ -362,13 +362,7 @@ fn file_replace_args(_id: Value, arguments: &Value) -> Option<FileReplaceArgs> {
 
 fn resolve_allowed_path(path: &Path) -> anyhow::Result<PathBuf> {
     let cwd = std::env::current_dir().context("failed to resolve current directory")?;
-    let root = match std::env::var_os("SAFEGUARD_WORKSPACE_ROOT") {
-        Some(root) => PathBuf::from(root),
-        None => cwd.clone(),
-    };
-    let root = root
-        .canonicalize()
-        .with_context(|| format!("failed to canonicalize workspace root {}", root.display()))?;
+    let root = workspace_root()?;
     let candidate = if path.is_absolute() {
         path.to_path_buf()
     } else {
@@ -391,7 +385,7 @@ fn resolve_allowed_path(path: &Path) -> anyhow::Result<PathBuf> {
 }
 
 fn reject_internal_state_target(root: &Path, target: &Path) -> anyhow::Result<()> {
-    let state_root = root.join(".safeguard");
+    let state_root = safeguard_core::legacy_workspace_state_root(root);
     let state_root = if state_root.exists() {
         state_root.canonicalize()?
     } else {
@@ -401,6 +395,16 @@ fn reject_internal_state_target(root: &Path, target: &Path) -> anyhow::Result<()
         anyhow::bail!("target is inside Safeguard internal state");
     }
     Ok(())
+}
+
+fn workspace_root() -> anyhow::Result<PathBuf> {
+    let cwd = std::env::current_dir().context("failed to resolve current directory")?;
+    let root = match std::env::var_os("SAFEGUARD_WORKSPACE_ROOT") {
+        Some(root) => PathBuf::from(root),
+        None => cwd,
+    };
+    root.canonicalize()
+        .with_context(|| format!("failed to canonicalize workspace root {}", root.display()))
 }
 
 fn replacement_plan_result(
@@ -431,7 +435,7 @@ fn replacement_plan_result(
 }
 
 fn read_audit_summary(limit: usize) -> anyhow::Result<Value> {
-    let audit_path = Path::new(".safeguard").join("audit.jsonl");
+    let audit_path = safeguard_core::workspace_state_root(workspace_root()?).join("audit.jsonl");
     if !audit_path.exists() {
         return Ok(json!({
             "status": "empty",

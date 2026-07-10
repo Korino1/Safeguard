@@ -26,7 +26,7 @@ try {
         cargo build -p safeguard-mcp --release
         cargo build -p safeguard-hook --release
         Copy-Item ".\target\release\safeguard-mcp.exe" "$PluginPath\bin\windows\safeguard-mcp.exe" -Force
-        Copy-Item ".\target\release\safeguard-hook.exe" "$PluginPath\bin\windows\safeguard-hook-1.3.5.exe" -Force
+        Copy-Item ".\target\release\safeguard-hook.exe" "$PluginPath\bin\windows\safeguard-hook-1.4.0.exe" -Force
         Copy-Item "$PluginPath\.mcp.windows.json" "$PluginPath\.mcp.json" -Force
         Copy-Item "$PluginPath\hooks\hooks.windows.json" "$PluginPath\hooks\hooks.json" -Force
         Invoke-OptionalValidator
@@ -40,7 +40,7 @@ try {
         cargo build -p safeguard-hook --release --target x86_64-unknown-linux-musl
         New-Item -ItemType Directory -Force -Path "$PluginPath\bin\linux" | Out-Null
         Copy-Item ".\target\x86_64-unknown-linux-musl\release\safeguard-mcp" "$PluginPath\bin\linux\safeguard-mcp" -Force
-        Copy-Item ".\target\x86_64-unknown-linux-musl\release\safeguard-hook" "$PluginPath\bin\linux\safeguard-hook-1.3.5" -Force
+        Copy-Item ".\target\x86_64-unknown-linux-musl\release\safeguard-hook" "$PluginPath\bin\linux\safeguard-hook-1.4.0" -Force
         Copy-Item "$PluginPath\.mcp.linux.json" "$PluginPath\.mcp.json" -Force
         Copy-Item "$PluginPath\hooks\hooks.linux.json" "$PluginPath\hooks\hooks.json" -Force
         Invoke-OptionalValidator
